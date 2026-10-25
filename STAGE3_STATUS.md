@@ -54,5 +54,13 @@ plus a sparse compare tree).
 - macOS ARM64: 95 tests OK (1 x86-only skip), incl. switch end-to-end (exit 50, stdout identical)
 - Linux x86-64: 95 tests OK (1 macOS-only skip)
 
+## Scalar SSE floating point — run 40185511058 (2026-10-25)
+Fixture `test/fp.exe` (double/float arithmetic, sqrt, min/max, compares,
+conversions, NaN/inf/denormal/signed-zero cases; every result printed as bits).
+- Windows reference: exit 27, stdout sha256 `e1d65980…` = golden (1681 bytes)
+- macOS ARM64: 104 tests OK (2 x86-only differential skips), incl. fp end-to-end and the
+  portable SSE unit tests (x86 NaN rules and integer-indefinite conversions on an ARM64 host)
+- Linux x86-64: 104 tests OK (1 macOS-only skip); SSE differential 8,119,800 cases, 0 failures
+
 ## Not implemented
 See "Limitations" in `docs/TRANSLATION.md`. 

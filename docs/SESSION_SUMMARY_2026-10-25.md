@@ -75,6 +75,13 @@ executables (no Wine, no CPU emulation at run time). First fixture:
     targets, faulting otherwise. Fixture `test/switch.exe` (exit 50) matches its
     model and the Windows run; 95 tests pass on Linux and macOS ARM64.
 
+12. **Scalar SSE.** `runtime/x86_sse.h` implements bit-exact scalar SSE/SSE2
+    with explicit x86 NaN/indefinite rules (ARM64 differs natively); lifter
+    covers the forms clang emits for `test/fp.c`. A surviving mutant showed that
+    an x86 differential test cannot catch the ARM64 saturating float->int cast,
+    so portable SDM-derived tests were added (they run on the macOS runner).
+    `fp.exe` (exit 27, 1681 bytes) matches its model and the Windows run.
+
 ## Open items / caveats
 - Golden output now confirmed on Windows (see `test/golden/README.md`).
 - Undefined x86 flags are left unchanged (a legal outcome).
@@ -90,5 +97,5 @@ limitations), `docs/DECODER_CFG.md`, `runtime/README.md`,
 Remill Apache-2.0 used only as architectural references, no code copied).
 
 ## Next step
-Options: scalar SSE floating point (movsd/addsd/cvt*, needed by most real
-programs), more kernel32 imports, or tail calls between functions.
+Options: more kernel32 imports (command line, memory, file input),
+tail calls between functions, packed SSE, MXCSR modelling.
