@@ -89,6 +89,10 @@ jobs:
           note stdout-sha256 "translated=$(shasum -a 256 < build/hello.stdout | cut -c1-16) golden=$(shasum -a 256 < test/golden/hello.stdout | cut -c1-16) bytes=$(wc -c < build/hello.stdout | tr -d ' ')"
           note tests "$(grep -E '^Ran [0-9]+ tests' verify.log | tail -1) -> $(grep -E '^(OK|FAILED)' verify.log | tail -1)"
           grep -E '\.\.\. skipped' verify.log | head -10 | while IFS= read -r l; do note skipped "$l"; done || true
+          awk '/^(FAIL|ERROR): /{p=1;n=0} p{print; if(++n>=30){p=0}}' verify.log > failures.txt || true
+          if [ -s failures.txt ]; then
+            note test-failures "$(head -c 3500 failures.txt | tr '\n' '|' )"
+          fi
           note package-smoke "$(cat dist/smoke.txt 2>/dev/null || echo 'not run') | dmg=$(ls -l dist/Hello.dmg 2>/dev/null | awk '{print $5}') bytes | $(codesign -dv dist/Hello.app 2>&1 | grep -E '^Signature=' || echo 'unsigned')"
 
       - name: Upload results
