@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .decoder import (FLOW_CALL, FLOW_COND, FLOW_JUMP, FLOW_RET, FLOW_TRAP,
+from .decoder import (FLOW_CALL, FLOW_COND, FLOW_JUMP, FLOW_NONE, FLOW_RET, FLOW_TRAP,
                       DecodeError, Instruction, decode_one)
 
 NORETURN_IMPORTS = frozenset({("kernel32.dll", "ExitProcess")})
@@ -202,9 +202,32 @@ def discover(pe, strict_indirect_jumps: bool = False) -> Program:
         succ: dict[int, list[int]] = {}
         term: dict[int, str] = {}
         preds: dict[int, set[int]] = {}
-        func_tables: list[tuple[JumpTable, list[int]]] = []
+        func_tables: list[tuple[JumpTable, list]] = []   # (table, [(va, required preds)])
+        pending: dict[int, tuple[PendingTable, list[int]]] = {}
+        resolved: dict[int, tuple[PendingTable, int]] = {}
         work = [froot]
-        while work:
+        while True:
+            if not work:
+                # Tables whose base register was set before the bounds check:
+                # resolve with reaching definitions over the edges known so far;
+                # new targets may add edges, so iterate (and re-verify at the end).
+                for jva, (pt, chain) in list(pending.items()):
+                    table = _reaching_lea(d, preds, pt.load, pt.base_reg)
+                    if table is None:
+                        continue
+                    jt = _table_targets(d, d.insns[jva], table, pt.count, pt.bound_check)
+                    del pending[jva]
+                    resolved[jva] = (pt, table)
+                    jump_tables[jva] = jt
+                    func_tables.append((jt, chain))
+                    succ[jva] = sorted(set(jt.targets))
+                    term[jva] = "jump_table"
+                    for t in succ[jva]:
+                        preds.setdefault(t, set()).add(jva)
+                        work.append(t)
+                if not work:
+                    break
+                continue
             va = work.pop()
             if va in succ:
                 continue
@@ -233,10 +256,14 @@ def discover(pe, strict_indirect_jumps: bool = False) -> Program:
                             dynamic_tail_jumps[va] = str(exc).split(" (", 1)[-1].rstrip(")")
                             kind = "tailcall_dynamic"
                         else:
-                            jump_tables[va] = jt
-                            func_tables.append((jt, chain))
-                            nxt = sorted(set(jt.targets))
-                            kind = "jump_table"
+                            if isinstance(jt, PendingTable):
+                                pending[va] = (jt, chain)      # resolved once the function is explored
+                                kind = "tailcall_dynamic"
+                            else:
+                                jump_tables[va] = jt
+                                func_tables.append((jt, chain))
+                                nxt = sorted(set(jt.targets))
+                                kind = "jump_table"
             elif insn.flow == FLOW_CALL:
                 if insn.direct_target is not None:
                     call_sites[va] = CallSite(va, "direct", target=insn.direct_target)
@@ -270,12 +297,33 @@ def discover(pe, strict_indirect_jumps: bool = False) -> Program:
             for t in nxt:
                 preds.setdefault(t, set()).add(va)
                 work.append(t)
+        for jva, (pt, chain) in pending.items():          # never resolved: dynamic tail call
+            if strict_indirect_jumps:
+                raise CFGError(f"0x{jva:x}: unresolved indirect jump (table base register not a unique "
+                               "`lea [rip+T]` on every path)")
+            dynamic_tail_jumps[jva] = "table base register not a unique `lea [rip+T]` on every path"
+        for jva, (pt, table) in resolved.items():          # the base must still be unique on the full graph
+            if _reaching_lea(d, preds, pt.load, pt.base_reg) != table:
+                raise CFGError(f"0x{jva:x}: jump-table base changed after its targets were explored")
         # The bounds proof assumed the guard -> jmp chain is entered only through
         # the guard. Re-check now that every edge of the function is known.
-        for jt, chain in func_tables:
-            for prev, cur in zip(chain, chain[1:]):
-                if preds.get(cur, set()) != {prev}:
-                    raise CFGError(f"0x{jt.jmp:x}: jump-table sequence is entered at 0x{cur:x} "
+        for jt, proof in func_tables:
+            if any(preds.get(va, set()) != set(expect) for va, expect in proof):
+                # edges found later (e.g. a second guard re-entering the sequence):
+                # the table is accepted only if it re-matches on the complete graph
+                try:
+                    again, proof = _match_jump_table(d, d.insns[jt.jmp], preds)
+                except CFGError:
+                    again = None
+                if isinstance(again, PendingTable):
+                    t = _reaching_lea(d, preds, again.load, again.base_reg)
+                    again = None if t is None else _table_targets(d, d.insns[jt.jmp], t, again.count,
+                                                                  again.bound_check)
+                if again is None or (again.table, again.count) != (jt.table, jt.count):
+                    proof = [(jt.jmp, None)]
+            for va, expect in proof:
+                if expect is None or preds.get(va, set()) != set(expect):
+                    raise CFGError(f"0x{jt.jmp:x}: jump-table sequence is entered at 0x{va:x} "
                                    "from outside its bounds check")
         func_succ[froot] = succ
         func_term[froot] = term
@@ -336,29 +384,176 @@ MAX_JUMP_TABLE_ENTRIES = 4096
 _NONVOLATILE = frozenset({3, 5, 6, 7, 12, 13, 14, 15})
 
 
-def _upper_half_zero(d, preds, va, reg_index, limit=64):
+def _upper_half_zero(d, preds, va, reg_index, limit=4096):
     """Prove that bits 32..63 of GPR `reg_index` are zero on entry to `va`:
-    walk back along a unique-predecessor chain to the last instruction that
-    writes the register; a 32-bit write zero-extends. Calls are crossed only
-    for callee-saved registers. Anything else -> False (no proof)."""
+    on every intra-procedural path backwards, the last instruction writing the
+    register must be a plain 32-bit write (which zero-extends). Calls are
+    crossed only for callee-saved registers; reaching the function entry, an
+    unknown predecessor set, or any other write gives False (no proof).
+    The result depends on the edges known so far; jump tables re-verify their
+    proof on the complete graph."""
     from .decoder import make_register
-    cur = va
+    seen, stack = set(), [va]
+    while stack:
+        cur = stack.pop()
+        ps = preds.get(cur, set())
+        if not ps:
+            return False
+        for p in ps:
+            if p in seen:
+                continue
+            seen.add(p)
+            if len(seen) > limit:
+                return False
+            insn = d.insns[p]
+            w = [make_register(n) for n in insn.regs_written
+                 if make_register(n).kind == "gpr" and make_register(n).index == reg_index]
+            if not w:
+                if insn.flow == FLOW_CALL and reg_index not in _NONVOLATILE:
+                    return False
+                stack.append(p)
+                continue
+            if not (all(r.width == 32 for r in w) and not any(make_register(n).high8 for n in insn.regs_written
+                                                             if make_register(n).kind == "gpr")):
+                return False
+    return True
+
+
+@dataclass(frozen=True)
+class PendingTable:
+    """A bounded table whose base register is set before the bounds check."""
+    jmp: int
+    base_reg: int                  # GPR index holding the table base
+    load: int                      # VA of the `movsxd` that reads the table
+    count: int
+    bound_check: int
+
+
+def _writes_gpr(insn, index):
+    from .decoder import make_register
+    return [make_register(n) for n in insn.regs_written
+            if make_register(n).kind == "gpr" and make_register(n).index == index]
+
+
+def _copy_before(d, preds, va, reg_index, limit=8):
+    """`mov X32, R32` shortly before `va` (unique-predecessor walk) with neither
+    register written in between: X then holds R zero-extended. Returns X."""
+    cur, clobbered = va, set()
     for _ in range(limit):
         ps = preds.get(cur, set())
         if len(ps) != 1:
-            return False
+            return None
         (cur,) = ps
         insn = d.insns[cur]
-        if insn.flow == FLOW_CALL:
-            if reg_index in _NONVOLATILE:
+        if insn.flow != FLOW_NONE:
+            return None
+        ops = insn.operands
+        if insn.mnemonic == "mov" and len(ops) == 2 and all(o.kind == "reg" and o.reg.kind == "gpr" for o in ops) \
+                and ops[0].reg.width == 32 and ops[1].reg.width == 32 and ops[1].reg.index == reg_index \
+                and ops[0].reg.index not in clobbered and ops[0].reg.index != reg_index:
+            return ops[0].reg.index
+        if _writes_gpr(insn, reg_index):
+            return None
+        from .decoder import make_register
+        clobbered.update(make_register(n).index for n in insn.regs_written if make_register(n).kind == "gpr")
+    return None
+
+
+def _reaching_lea(d, preds, va, reg_index):
+    """All definitions of GPR `reg_index` reaching instruction `va`, searched
+    backwards over every intra-procedural path. Returns the table VA T if every
+    reaching definition is `lea reg64, [rip + T]` with the same T; None otherwise.
+    Calls are crossed only for callee-saved registers; reaching the function
+    entry without a definition gives None."""
+    seen, defs, stack = set(), set(), [va]
+    while stack:
+        cur = stack.pop()
+        ps = preds.get(cur, set())
+        if not ps:
+            return None                                # function entry: value comes from the caller
+        for p in ps:
+            if p in seen:
                 continue
-            return False
-        widths = [make_register(n).width for n in insn.regs_written
-                  if make_register(n).kind == "gpr" and make_register(n).index == reg_index]
-        if widths:
-            return widths == [32] and not any(make_register(n).high8 for n in insn.regs_written
-                                              if make_register(n).kind == "gpr")
-    return False
+            seen.add(p)
+            insn = d.insns[p]
+            w = _writes_gpr(insn, reg_index)
+            if insn.flow == FLOW_CALL and not w:
+                if reg_index not in _NONVOLATILE:
+                    return None
+                stack.append(p)
+                continue
+            if not w:
+                stack.append(p)
+                continue
+            ops = insn.operands
+            if insn.mnemonic == "lea" and len(ops) == 2 and len(w) == 1 and w[0].width == 64 \
+                    and ops[1].kind == "mem" and ops[1].mem.rip_target is not None:
+                defs.add(ops[1].mem.rip_target)
+                if len(defs) > 1:
+                    return None
+            else:
+                return None
+    return defs.pop() if len(defs) == 1 else None
+
+
+def _same_mem(a, b):
+    return (a.base, a.index, a.scale, a.disp, a.segment) == (b.base, b.index, b.scale, b.disp, b.segment)
+
+
+def _match_mem_index(d, body, mem, fail):
+    """Bounds check on a memory operand: the first instruction of the guarded
+    sequence must re-load exactly that dword into a 32-bit register
+    (zero-extending). The guard edge leads straight to it, so nothing runs in
+    between. Returns the register index."""
+    first = d.insns[body[0]]
+    if first.mnemonic != "mov" or len(first.operands) != 2:
+        raise fail("memory bounds check not followed by a re-load")
+    dst, src = first.operands
+    if not (dst.kind == "reg" and dst.reg.kind == "gpr" and dst.reg.width == 32 and src.kind == "mem"
+            and src.size == 4 and _same_mem(src.mem, mem)):
+        raise fail("memory bounds check not followed by a re-load of the same dword")
+    return dst.reg.index
+
+
+def _operand_key(op):
+    if op.kind == "reg":
+        return ("reg", op.reg.index, op.reg.width, op.reg.high8)
+    m = op.mem
+    return ("mem", op.size, m.base, m.index, m.scale, m.disp, m.segment, m.rip_target)
+
+
+def _guard_edges(d, preds, ps, cur):
+    """If every predecessor edge into `cur` is a bounds-check edge
+    (`cmp X, N` directly followed by a branch that reaches `cur` only when
+    X <= N, unsigned: ja/jae fall-through or jbe/jb taken), return
+    [(branch, cmp, entry_count)], else None."""
+    if not ps:
+        return None
+    out = []
+    for p in ps:
+        br = d.insns[p]
+        if br.mnemonic in ("ja", "jae") and br.next == cur and br.direct_target != cur:
+            inclusive = br.mnemonic == "ja"
+        elif br.mnemonic in ("jbe", "jb") and br.direct_target == cur and br.next != cur:
+            inclusive = br.mnemonic == "jbe"
+        else:
+            return None
+        cps = preds.get(p, set())
+        if len(cps) != 1:
+            return None
+        (c,) = cps
+        cmp = d.insns[c]
+        if cmp.mnemonic != "cmp" or cmp.next != p or len(cmp.operands) != 2 or cmp.operands[1].kind != "imm":
+            return None
+        x = cmp.operands[0]
+        if x.kind == "reg":
+            if x.reg.kind != "gpr" or x.reg.width not in (8, 16, 32, 64) or x.reg.high8:
+                return None
+        elif not (x.kind == "mem" and x.size == 4 and x.mem.segment is None and x.mem.rip_target is None):
+            return None
+        n = cmp.operands[1].imm & ((1 << (x.size * 8 if x.kind == "mem" else x.reg.width)) - 1)
+        out.append((p, cmp, n + 1 if inclusive else n))
+    return out
 
 
 def _match_jump_table(d, jmp, preds):
@@ -383,54 +578,91 @@ def _match_jump_table(d, jmp, preds):
     if op is None or op.kind != "reg" or op.reg.kind != "gpr" or op.reg.width != 64:
         raise fail("not a jump through a 64-bit register")
 
-    chain = [jmp.address]
+    body = [jmp.address]                  # chain head .. jmp, entered only through the guard edges
     cur = jmp.address
-    guard = None
+    guards = None
     for _ in range(12):
         ps = preds.get(cur, set())
+        guards = _guard_edges(d, preds, ps, cur)
+        if guards:
+            break
         if len(ps) != 1:
             raise fail("no unique fall-through predecessor")
         (p,) = ps
         pin = d.insns[p]
         if pin.next != cur:
             raise fail("predecessor is a branch, not fall-through")
-        chain.insert(0, p)
-        if pin.mnemonic in ("ja", "jae"):
-            guard = pin
-            break
+        if pin.flow != FLOW_NONE:
+            raise fail(f"control flow inside the table sequence at 0x{p:x}")
+        body.insert(0, p)
         cur = p
-    if guard is None:
+    if not guards:
         raise fail("no bounds check found")
-    gp = preds.get(guard.address, set())
-    if len(gp) != 1:
-        raise fail("bounds check has no unique predecessor")
-    (cmp_va,) = gp
-    cmp = d.insns[cmp_va]
-    if cmp.mnemonic != "cmp" or cmp.next != guard.address or len(cmp.operands) != 2:
-        raise fail("bounds check is not `cmp reg, imm` immediately before the branch")
-    idx_op, lim_op = cmp.operands
-    if idx_op.kind != "reg" or idx_op.reg.kind != "gpr" or idx_op.reg.width not in (32, 64)             or idx_op.reg.high8 or lim_op.kind != "imm":
-        raise fail("bounds check is not `cmp r32/r64, imm`")
-    limit = lim_op.imm
-    count = limit + 1 if guard.mnemonic == "ja" else limit
+    counts = {g[2] for g in guards}
+    xs = {_operand_key(g[1].operands[0]) for g in guards}
+    if len(counts) != 1 or len(xs) != 1:
+        raise fail("bounds checks on different operands or limits")
+    count = counts.pop()
     if not 0 < count <= MAX_JUMP_TABLE_ENTRIES:
         raise fail(f"implausible table size {count}")
+    if len(body) < 2:
+        raise fail("no table load after the bounds check")
+    cmps = [g[1] for g in guards]
+    cmp = min(cmps, key=lambda c: c.address)
+    idx_op = cmp.operands[0]
+    mem_idx = idx_op.mem if idx_op.kind == "mem" else None
+    # every edge into the sequence must still be exactly these after exploration
+    proof = [(body[0], frozenset(g[0] for g in guards))]
+    proof += [(g[0], frozenset({g[1].address})) for g in guards]
+    proof += [(b, frozenset({a})) for a, b in zip(body, body[1:])]
 
     # symbolic register state: full-register index -> ("idx",) | ("base", T) | ("entry", T) | ("target", T)
     sym = {}
-    if idx_op.reg.width == 64:
+    reload_va = None
+    idx32 = idx_small = None
+    if mem_idx is not None:
+        sym[_match_mem_index(d, body, mem_idx, fail)] = ("idx",)
+        reload_va = body[0]
+    elif idx_op.reg.width == 64:
         sym[idx_op.reg.index] = ("idx",)
-    idx32 = idx_op.reg.index if idx_op.reg.width == 32 else None   # zero-extension still required
-    if idx32 is not None and _upper_half_zero(d, preds, cmp.address, idx32):
-        sym[idx32] = ("idx",)          # the full 64-bit register already equals the bounded index
+    elif idx_op.reg.width == 32:
+        idx32 = idx_op.reg.index           # zero-extension still required
+        if all(_upper_half_zero(d, preds, c.address, idx32) for c in cmps):
+            sym[idx32] = ("idx",)          # the full 64-bit register already equals the bounded index
+        copies = {_copy_before(d, preds, c.address, idx32) for c in cmps}
+        if len(copies) == 1 and None not in copies:
+            sym[copies.pop()] = ("idx",)   # `mov r32, idx32` before the compare: zero-extended copy
+    else:
+        # 8/16-bit compare: the index must be re-derived by `movzx r32, <same reg>`
+        idx_small = (idx_op.reg.index, idx_op.reg.width)
 
     def regs(insn):
         return [o for o in insn.operands]
 
-    for va in chain[1:-1]:
+    from .decoder import make_register
+    written = set()
+    for va in body[:-1]:
+        insn = d.insns[va]
+        for n in insn.regs_written:
+            r = make_register(n)
+            if r.kind == "gpr":
+                written.add(r.index)
+    for va in body[:-1]:
+        if va == reload_va:
+            continue
         insn = d.insns[va]
         ops = regs(insn)
         mn = insn.mnemonic
+        if mn == "movzx" and len(ops) == 2 and idx_small is not None and ops[0].kind == "reg" \
+                and ops[0].reg.kind == "gpr" and ops[0].reg.width == 32 and ops[1].kind == "reg" \
+                and ops[1].reg.kind == "gpr" and not ops[1].reg.high8 \
+                and (ops[1].reg.index, ops[1].reg.width) == idx_small:
+            sym[ops[0].reg.index] = ("idx",)              # zero-extended bounded 8/16-bit index
+            if ops[0].reg.index == idx_small[0]:
+                idx_small = None
+            if ops[0].reg.index == idx32:
+                idx32 = None
+            continue
         if mn == "mov" and len(ops) == 2 and all(o.kind == "reg" and o.reg.kind == "gpr" for o in ops)                 and ops[0].reg.width == ops[1].reg.width and ops[0].reg.width in (32, 64):
             dst, src = ops
             src_sym = sym.get(src.reg.index)
@@ -449,6 +681,11 @@ def _match_jump_table(d, jmp, preds):
         elif mn == "movsxd" and len(ops) == 2 and ops[0].kind == "reg" and ops[0].reg.width == 64                 and ops[1].kind == "mem" and ops[1].size == 4:
             m = ops[1].mem
             b = sym.get(m.base.index) if m.base is not None and m.base.kind == "gpr" else None
+            if b is None and m.base is not None and m.base.kind == "gpr" and m.base.width == 64 \
+                    and m.base.index not in written:
+                # base register set before the bounds check: resolved by reaching
+                # definitions over the whole function (see _reaching_lea)
+                b = ("base", ("reg", m.base.index, va))
             i = sym.get(m.index.index) if m.index is not None and m.index.kind == "gpr" else None
             if not (b and b[0] == "base" and i == ("idx",) and m.scale == 4 and m.disp == 0
                     and m.segment is None and m.index.width == 64):
@@ -458,12 +695,18 @@ def _match_jump_table(d, jmp, preds):
                 idx32 = None
         elif mn == "add" and len(ops) == 2 and all(o.kind == "reg" and o.reg.width == 64 for o in ops):
             a, b = sym.get(ops[0].reg.index), sym.get(ops[1].reg.index)
+            # a deferred base register (set before the bounds check, untouched since)
+            for x, y, other in ((a, b, ops[1]), (b, a, ops[0])):
+                if x and x[0] == "entry" and isinstance(x[1], tuple) and y is None \
+                        and other.reg.index == x[1][1] and other.reg.index not in written:
+                    if x is a:
+                        b = ("base", x[1])
+                    else:
+                        a = ("base", x[1])
             pair = {a[0] if a else None, b[0] if b else None}
             if pair != {"entry", "base"} or a[1] != b[1]:
                 raise fail(f"unexpected add at 0x{va:x}")
             sym[ops[0].reg.index] = ("target", a[1])
-        elif mn in ("ja", "jae") and va == chain[0]:
-            continue
         else:
             raise fail(f"unexpected instruction '{insn.text}' at 0x{va:x}")
 
@@ -471,6 +714,14 @@ def _match_jump_table(d, jmp, preds):
     if not final or final[0] != "target":
         raise fail("jump register is not table base + table entry")
     table = final[1]
+    if isinstance(table, tuple):                       # ("reg", index, load VA): needs reaching definitions
+        return PendingTable(jmp.address, table[1], table[2], count, cmp.address), proof
+    return _table_targets(d, jmp, table, count, cmp.address), proof
+
+
+def _table_targets(d, jmp, table, count, cmp_va):
+    def fail(why):
+        return CFGError(f"0x{jmp.address:x}: unresolved indirect jump '{jmp.text}' ({why})")
     targets = []
     for k in range(count):
         ea = table + 4 * k
@@ -482,7 +733,7 @@ def _match_jump_table(d, jmp, preds):
         if not d.in_code(t):
             raise fail(f"table entry {k} -> 0x{t:x} is not in an executable section")
         targets.append(t)
-    return JumpTable(jmp.address, table, count, tuple(targets), cmp.address), [cmp.address] + chain
+    return JumpTable(jmp.address, table, count, tuple(targets), cmp_va)
 
 
 def _build_blocks(froot, succ, term, insns, func_roots):
