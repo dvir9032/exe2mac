@@ -358,8 +358,16 @@ class FailClosedLifterTests(unittest.TestCase):
         from recompiler.cfg import discover
         pe = FakePE(bytes.fromhex("48b80000004001000000c3"))                    # movabs rax, imm64
         pe.relocs = [0x1002]
-        with self.assertRaisesRegex(TranslationError, "relocation at RVA 0x1002 patches code"):
+        with self.assertRaisesRegex(TranslationError, "relocation at RVA 0x1002 patches instruction at 0x140001000"):
             Lifter(pe, discover(pe)).emit()
+
+    def test_relocated_data_inside_an_executable_section_is_fine(self):
+        from recompiler.lift_c import Lifter
+        from recompiler.cfg import discover
+        # ret ; 7 bytes padding ; a relocated pointer (MSVC merges .rdata into .text)
+        pe = FakePE(bytes.fromhex("c3" + "cc" * 7) + (0x140002000).to_bytes(8, "little"))
+        pe.relocs = [0x1008]
+        Lifter(pe, discover(pe)).emit()
 
     def test_generated_code_never_contains_fallback_noop(self):
         src = self.lift("4831c0c3")                                              # xor rax, rax ; ret
@@ -469,3 +477,9 @@ class Wave3SnippetTests(_SnippetCheck, unittest.TestCase):
                    "488d642418f27505ba07000000f2c3",
                    {"rax": 3, "rcx": 0x3ff0000000000000, "rdx": 7},
                    {"cf": 0, "pf": 0, "af": 0, "zf": 1, "sf": 0, "of": 0})
+
+    def test_gs_reads_the_teb_and_peb(self):
+        # mov rax, gs:[0x30] (TEB.Self); mov rcx, gs:[0x60] (PEB); mov rdx, [rcx+0x10] (ImageBaseAddress);
+        # mov rbx, gs:[0x10] (StackLimit); mov esi, gs:[0x48] (thread id); ret
+        self.check("65488b04253000000065488b0c2560000000488b511065488b1c2510000000658b342548000000c3",
+                   {"rax": 0x10100000, "rcx": 0x10102000, "rdx": 0x140000000, "rbx": 0x10000000, "rsi": 0x1004})

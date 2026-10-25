@@ -156,7 +156,7 @@ class _Fn:
         if any(x in (0xF0, 0xF2, 0xF3) for x in p):
             raise _err(self.insn, "LOCK/REP prefixes are not supported")
         for op in self.insn.operands:
-            if op.kind == "mem" and op.mem.segment is not None:
+            if op.kind == "mem" and op.mem.segment is not None and op.mem.segment.name != "gs":
                 raise _err(self.insn, f"segment override {op.mem.segment.name} is not supported")
             if op.kind == "reg" and op.reg.kind != "gpr" and not (op.reg.kind == "xmm" and mn in SSE_MNEMONICS):
                 raise _err(self.insn, f"register {op.reg.name} is not supported")
@@ -164,6 +164,10 @@ class _Fn:
     def ea(self, op: Operand) -> str:
         m = op.mem
         parts = []
+        if m.segment is not None:
+            if m.segment.name != "gs":
+                raise _err(self.insn, f"segment override {m.segment.name} is not supported")
+            parts.append("EXE2MAC_TEB_BASE")              # GS base = this thread's TEB
         if m.base is not None:
             if m.base.kind == "rip":
                 rva = m.rip_target - self.l.pref_base
@@ -248,13 +252,26 @@ class Lifter:
         return f"L_{va:x}"
 
     def check_relocations(self):
-        exec_ranges = [(s.vaddr, s.vaddr + max(s.vsize, s.raw_size)) for s in self.pe.sections if s.executable]
+        """A relocation inside a translated instruction would change an
+        immediate that the generated code has already baked in. Relocations of
+        data that merely lives in an executable section (MSVC /MERGE:.rdata=.text)
+        are applied to guest memory by the loader as usual."""
+        import bisect
+        starts = sorted(self.prog.instructions)
         for r in self.pe.relocs:
-            if any(lo <= r < hi for lo, hi in exec_ranges):
+            va = self.pref_base + r
+            i = bisect.bisect_right(starts, va + 7) - 1      # last instruction starting before the 8 bytes end
+            while i >= 0:
+                insn = self.prog.instructions[starts[i]]
+                if insn.address + insn.size <= va:
+                    break
                 raise TranslationError(
-                    f"relocation at RVA 0x{r:x} patches code; absolute addresses in instructions are not supported")
+                    f"relocation at RVA 0x{r:x} patches instruction at 0x{insn.address:x}; "
+                    "absolute addresses in instructions are not supported")
 
     def check_imports(self):
+        if self.trap_unsupported:          # missing bridges raise when called (see the loader)
+            return
         for _, dll, name in self.pe.imports:
             if (dll, name) not in SUPPORTED_IMPORTS:
                 raise TranslationError(f"unsupported import {dll}!{name}")
@@ -903,6 +920,8 @@ class Lifter:
             out.append("    {0, 0, 0},")
         out.append("};")
         out.append(f"const unsigned exe2mac_nimports = {len(pe.imports)}u;")
+        if self.trap_unsupported:
+            out.append("const int exe2mac_trap_missing_imports = 1;")
         return out
 
     def emit(self) -> str:

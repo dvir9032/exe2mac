@@ -10,6 +10,7 @@
 #include "process.h"
 
 uint64_t g_exe2mac_base;
+__attribute__((weak)) const int exe2mac_trap_missing_imports = 0;
 
 static int fail(const char *msg, uint64_t a) {
     fprintf(stderr, "exe2mac: load error: %s (0x%" PRIx64 ")\n", msg, a);
@@ -58,7 +59,9 @@ int exe2mac_load(x86_state *s, guest_mem *m, uint64_t base) {
     for (unsigned i = 0; i < exe2mac_nimports; i++) {
         const exe2mac_import *imp = &exe2mac_imports[i];
         int b = exe2mac_find_bridge(imp->dll, imp->name);
-        if (b < 0) {
+        if (b < 0 && exe2mac_trap_missing_imports) {
+            b = (int)(exe2mac_nbridges + i);          /* thunk that raises when called */
+        } else if (b < 0) {
             fprintf(stderr, "exe2mac: load error: unsupported import %s!%s\n", imp->dll, imp->name);
             return -1;
         }
@@ -80,6 +83,21 @@ int exe2mac_load(x86_state *s, guest_mem *m, uint64_t base) {
     if (!stack) return fail("out of memory", EXE2MAC_STACK_SIZE);
     if (guest_map(m, EXE2MAC_STACK_BASE, EXE2MAC_STACK_SIZE, stack, GUEST_PERM_R | GUEST_PERM_W, "stack"))
         return fail("cannot map stack", EXE2MAC_STACK_BASE);
+
+    /* TEB and PEB for the single guest thread */
+    uint8_t *teb = calloc(1, EXE2MAC_TEB_SIZE), *peb = calloc(1, EXE2MAC_PEB_SIZE);
+    if (!teb || !peb) return fail("out of memory", EXE2MAC_TEB_SIZE);
+    put64(teb + TEB_STACK_BASE, EXE2MAC_STACK_BASE + EXE2MAC_STACK_SIZE);
+    put64(teb + TEB_STACK_LIMIT, EXE2MAC_STACK_BASE);             /* whole stack committed */
+    put64(teb + TEB_SELF, EXE2MAC_TEB_BASE);
+    put64(teb + TEB_CLIENT_PROCESS, EXE2MAC_GUEST_PID);
+    put64(teb + TEB_CLIENT_THREAD, EXE2MAC_GUEST_TID);
+    put64(teb + TEB_PEB, EXE2MAC_PEB_BASE);
+    put64(peb + PEB_IMAGE_BASE, base);
+    put64(peb + PEB_PROCESS_HEAP, EXE2MAC_HEAP_HANDLE);
+    if (guest_map(m, EXE2MAC_TEB_BASE, EXE2MAC_TEB_SIZE, teb, GUEST_PERM_R | GUEST_PERM_W, "TEB") ||
+        guest_map(m, EXE2MAC_PEB_BASE, EXE2MAC_PEB_SIZE, peb, GUEST_PERM_R | GUEST_PERM_W, "PEB"))
+        return fail("cannot map TEB/PEB", EXE2MAC_TEB_BASE);
 
     memset(s, 0, sizeof *s);
     s->mem = m;

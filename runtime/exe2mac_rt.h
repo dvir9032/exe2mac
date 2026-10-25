@@ -56,6 +56,32 @@ extern uint64_t g_exe2mac_base;              /* actual guest load base */
 #define EXE2MAC_STACK_BASE    0x0000000010000000ull
 #define EXE2MAC_STACK_SIZE    (1024u * 1024u)
 
+/* Thread and process environment blocks (x64 layouts; GS points at the TEB).
+ * Only the fields below are initialised; the rest read as zero. */
+#define EXE2MAC_TEB_BASE      0x0000000010100000ull
+#define EXE2MAC_TEB_SIZE      0x2000u
+#define EXE2MAC_PEB_BASE      0x0000000010102000ull
+#define EXE2MAC_PEB_SIZE      0x1000u
+#define TEB_STACK_BASE        0x08u      /* NT_TIB.StackBase (highest address + 1) */
+#define TEB_STACK_LIMIT       0x10u      /* NT_TIB.StackLimit (lowest committed address) */
+#define TEB_SELF              0x30u      /* NT_TIB.Self */
+#define TEB_CLIENT_PROCESS    0x40u      /* ClientId.UniqueProcess */
+#define TEB_CLIENT_THREAD     0x48u      /* ClientId.UniqueThread */
+#define TEB_TLS_POINTER       0x58u      /* ThreadLocalStoragePointer */
+#define TEB_PEB               0x60u      /* ProcessEnvironmentBlock */
+#define TEB_LAST_ERROR        0x68u      /* LastErrorValue */
+#define TEB_TLS_SLOTS         0x1480u    /* TlsSlots[64] */
+#define PEB_IMAGE_BASE        0x10u      /* ImageBaseAddress */
+#define PEB_PROCESS_HEAP      0x30u      /* ProcessHeap */
+#define EXE2MAC_GUEST_PID     0x1000u    /* ClientId values seen by the guest */
+#define EXE2MAC_GUEST_TID     0x1004u
+
+/* Set by the generator when built with --trap-unsupported: an import with no
+ * bridge is bound to a thunk that raises STATUS_ENTRYPOINT_NOT_FOUND when
+ * called, instead of failing the load. Weak default: 0. */
+extern const int exe2mac_trap_missing_imports;
+#define EXE2MAC_STATUS_ENTRYPOINT_NOT_FOUND 0xC0000139u
+
 void exe2mac_dispatch_external(x86_state *s, uint64_t target);
 
 /* Tail calls (`jmp` to another function or an import) are a trampoline: the
