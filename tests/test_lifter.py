@@ -343,7 +343,10 @@ class FailClosedLifterTests(unittest.TestCase):
         self.assertRejected("f2aec3", "REP")                                     # repne scasb
 
     def test_ret_imm(self):
-        self.assertRejected("c20800", "ret imm16")
+        # push 7 ; call f ; ret ; f: mov eax, 5 ; ret 8 (callee pops the pushed argument)
+        st = run_snippet("6a07e801000000c3b805000000c20800")
+        self.assertEqual(st["rax"], 5)
+        self.assertEqual(st["rsp_delta"], 8)
 
     def test_segment_override(self):
         self.assertRejected("64488b042530000000c3", "segment override fs")     # mov rax, fs:[0x30]

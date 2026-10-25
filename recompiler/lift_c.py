@@ -529,10 +529,12 @@ class Lifter:
         elif mn == "call":
             self.lift_call(f, insn)
         elif mn == "ret":
-            if ops:
-                raise _err(insn, "ret imm16 is not supported")
+            if ops and (ops[0].kind != "imm" or not 0 <= ops[0].imm <= 0xFFFF):
+                raise _err(insn, "invalid ret operand")
             f.emit(f"s->rip = {self.va_expr(insn.address)};")
             f.emit("s->rip = x86_pop64(s);")
+            if ops and ops[0].imm:
+                f.emit(f"s->gpr[X86_RSP] += 0x{ops[0].imm:x}u;")      # ret imm16: release callee-popped bytes
             f.emit("return;")
         elif mn in BIT_RMW:
             base, off = f.need(2)
