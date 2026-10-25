@@ -1,0 +1,54 @@
+# Probe: translate the official Notepad2-mod x64 release (BSD licence, not
+# stored in this repository) and run it on Apple silicon. Notepad2 is a GUI
+# program and exe2mac has no window layer yet, so the expected result today is
+# a clean stop at the first Windows function that is not implemented; the job
+# reports how far the translated program got.
+name: notepad2-probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe-macos-arm64:
+    runs-on: macos-14
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch Notepad2-mod 4.2.25.998 x64 (official release, pinned hash)
+        run: |
+          python3 -m pip install capstone==5.0.3
+          curl -sSL -o np2.zip https://github.com/XhmikosR/notepad2-mod/releases/download/4.2.25.998/Notepad2-mod.4.2.25.998_x64.zip
+          shasum -a 256 np2.zip
+          echo "$NP2_SHA  np2.zip" | shasum -a 256 -c -
+          mkdir np2 && cd np2 && unzip -q ../np2.zip
+        env:
+          NP2_SHA: c893ce4ac5f38ae9500d92f3ff4060542da2eae93a7d602b4bb5c4bec7562516
+      - name: Translate (unimplemented instructions and imports trap at run time)
+        run: |
+          start=$(date +%s)
+          python3 -m recompiler translate np2/Notepad2.exe -o np2.gen.c --trap-unsupported
+          echo "TRANSLATE_S=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+          ls -la np2.gen.c
+      - name: Compile for arm64 (-O0)
+        run: |
+          start=$(date +%s)
+          RT=$(python3 -c "from recompiler.translate import RUNTIME_SOURCES as R; print(' '.join('runtime/'+x for x in R))")
+          cc -std=c11 -D_DEFAULT_SOURCE -O0 -w -ffp-contract=off -arch arm64 -I . -I runtime np2.gen.c $RT -lm -o notepad2
+          echo "COMPILE_S=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+          file notepad2
+      - name: Run and report
+        if: always()
+        run: |
+          set +e
+          perl -e 'alarm 120; exec @ARGV' ./notepad2 > run.stdout 2> run.stderr
+          code=$?
+          set -e
+          tail -c 1500 run.stderr
+          last=$(tail -n 3 run.stderr | tr '\n' ' ' | tr -d '\r' | cut -c1-600)
+          echo "::notice title=notepad2-probe::host=$(sw_vers -productVersion) $(uname -m) $(sysctl -n machdep.cpu.brand_string) | translate=${TRANSLATE_S}s compile=${COMPILE_S}s | exit=$code | stderr: $last"
