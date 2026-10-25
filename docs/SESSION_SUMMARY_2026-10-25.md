@@ -89,6 +89,12 @@ executables (no Wine, no CPU emulation at run time). First fixture:
     auto-vectorised one loop (packed SSE, unsupported → translation stopped as
     intended), so this fixture is built with `-fno-vectorize -fno-slp-vectorize`.
 
+14. **Packed SSE2.** `runtime/x86_simd.h` + table-driven lifter forms cover
+    what clang's auto-vectoriser emits for `test/vec.c` and `test/io.c`; io.exe
+    is rebuilt vectorised (same golden). `vec.c` was first written with signed
+    overflow / negative left shift (UB) and was fixed before its golden was made.
+    A weakly covered sticky-bit path in `cvtsi2ss` got exact directed tests.
+
 ## Open items / caveats
 - Golden output now confirmed on Windows (see `test/golden/README.md`).
 - Undefined x86 flags are left unchanged (a legal outcome).
@@ -104,5 +110,5 @@ limitations), `docs/DECODER_CFG.md`, `runtime/README.md`,
 Remill Apache-2.0 used only as architectural references, no code copied).
 
 ## Next step
-Packed SSE2 integer/FP instructions so auto-vectorised code translates;
-then tail calls between functions, MXCSR modelling.
+Tail calls between functions; then MXCSR modelling, more SSE (SSSE3/SSE4 need
+a CPU-feature decision, since CPUID is not modelled).

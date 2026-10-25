@@ -71,5 +71,13 @@ Fixture `test/io.exe` (arguments + stdin, built without auto-vectorisation):
 - macOS ARM64: 107 tests OK (2 x86-only differential skips), incl. io end-to-end
 - Linux x86-64: 107 tests OK (1 macOS-only skip); heap/quoting 26,977 checks; bridges 113 checks
 
+## Packed SSE2 (auto-vectorised code) — run 40188515490 (2026-10-25)
+Fixture `test/vec.exe` (clang -O2 auto-vectorised integer and FP loops, 518
+packed-integer instructions); `test/io.exe` is now built with default -O2.
+- Windows reference: vec exit 42, stdout sha256 `1aa71e1b…` = golden (367 bytes);
+  vectorised io.exe still matches its golden (273 bytes)
+- macOS ARM64: 113 tests OK (3 x86-only differential skips), incl. vec and io end-to-end
+- Linux x86-64: 113 tests OK (1 macOS-only skip); packed differential 18,617,984 cases, 0 failures
+
 ## Not implemented
 See "Limitations" in `docs/TRANSLATION.md`. 
