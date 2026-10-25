@@ -144,10 +144,11 @@ Implemented exactly (defined flags computed; undefined flags left unchanged):
   rounding mode, `cvttsd2si` truncates. An exception whose mask bit is clear
   raises #XM; without SEH this ends the process with the NTSTATUS of the
   first unmasked flag in the order IE, DE, ZE, OE, UE, PE:
-  STATUS_FLOAT_INVALID_OPERATION 0xC0000090, _DENORMAL_OPERAND 0xC000008D,
-  _DIVIDE_BY_ZERO 0xC000008E (observed on Windows for test/mxcsr.exe),
-  _OVERFLOW 0xC0000091, _UNDERFLOW 0xC0000093, _INEXACT_RESULT 0xC000008F
-  (test/xm.exe checks each one on Windows CI). At the fault MXCSR holds what
+  STATUS_FLOAT_INVALID_OPERATION 0xC0000090 (for IE and also for DE: Windows
+  does not report STATUS_FLOAT_DENORMAL_OPERAND for SSE faults),
+  _DIVIDE_BY_ZERO 0xC000008E, _OVERFLOW 0xC0000091, _UNDERFLOW 0xC0000093,
+  _INEXACT_RESULT 0xC000008F. All six were observed on Windows CI
+  (test/xm.exe, one case per cause, plus all-unmasked overflow -> 0xC0000091). At the fault MXCSR holds what
   hardware records: an unmasked IE/DE/ZE stops before the computation (only
   pre-computation flags are set); an unmasked UE is raised on tininess alone,
   exact or not, and bypasses FTZ; under an unmasked OE/UE, PE is set only if

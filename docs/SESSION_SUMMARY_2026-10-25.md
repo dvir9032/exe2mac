@@ -103,6 +103,17 @@ executables (no Wine, no CPU emulation at run time). First fixture:
     version made every `lea [rip+code]` target a hard root, which decoded an
     in-.text jump table as code; candidates are now transactional.
 
+16. **MXCSR.** Scalar and packed SSE arithmetic moved onto an exact
+    soft-float core (`runtime/softfloat.h`) driven by MXCSR: RC, FTZ, DAZ and
+    the six sticky flags (19.8M masked differential cases, 640 portable
+    hardware vectors). Unmasked exceptions fault with a per-cause NTSTATUS;
+    Windows CI showed the real codes (0xC000008E for divide by zero, not the
+    0xC00002B4 first assumed, and INVALID_OPERATION for denormal operands).
+    A SIGFPE-based differential (8.4M cases) found and fixed three
+    fault-time MXCSR rules. The `test/xm.exe` switch led to a jump-table
+    zero-extension proof by backward walk (callee-saved registers only
+    across calls).
+
 ## Open items / caveats
 - Golden output now confirmed on Windows (see `test/golden/README.md`).
 - Undefined x86 flags are left unchanged (a legal outcome).
@@ -118,5 +129,5 @@ limitations), `docs/DECODER_CFG.md`, `runtime/README.md`,
 Remill Apache-2.0 used only as architectural references, no code copied).
 
 ## Next step
-MXCSR modelling (ldmxcsr/stmxcsr, rounding modes, cvtsd2si); CPUID and
-SSSE3/SSE4 (needs a decision on the advertised CPU features); more imports.
+CPUID and SSSE3/SSE4 (needs a decision on the advertised CPU features); more
+imports; a fast path for soft-float when MXCSR is the default.

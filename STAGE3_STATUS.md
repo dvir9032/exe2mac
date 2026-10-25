@@ -87,5 +87,17 @@ function pointers from `lea [rip+code]` and from a pointer table.
 - macOS ARM64: 122 tests OK (3 x86-only differential skips), incl. tail end-to-end
 - Linux x86-64: 122 tests OK (1 macOS-only skip)
 
+## Unmasked SSE exceptions — runs 40192469839 / 40193301397 (2026-10-25)
+#XM ends the process with a per-cause NTSTATUS; MXCSR at the fault matches
+hardware (pre-computation stop, UE on tininess, PE under unmasked OE/UE).
+Fixture `test/xm.exe` (one unmasked exception per case) needed a stronger
+jump-table rule: index zero-extension proved by an earlier 32-bit write.
+- Windows reference: mxcsr.exe ends with 0xC000008E (stdout = golden, 1405 bytes);
+  xm.exe cases 0..6 -> 0xC0000090, 0xC0000090 (DE is reported as INVALID_OPERATION),
+  0xC000008E, 0xC0000091, 0xC0000093, 0xC000008F, 0xC0000091 (all unmasked, OE)
+- macOS ARM64: 135 tests OK (5 x86-only differential skips), incl. mxcsr and xm end-to-end
+- Linux x86-64: 135 tests OK with gcc and clang (1 macOS-only skip);
+  unmasked-exception differential 8.4M cases (2.9M faulting), 0 failures
+
 ## Not implemented
 See "Limitations" in `docs/TRANSLATION.md`. 

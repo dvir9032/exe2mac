@@ -45,7 +45,7 @@ static uint32_t cfg, mx_after;
 static const uint32_t DEF = 0x1F80u;
 
 static uint32_t status_of(unsigned flags) {
-    static const uint32_t st[6] = { 0xC0000090u, 0xC000008Du, 0xC000008Eu, 0xC0000091u, 0xC0000093u, 0xC000008Fu };
+    static const uint32_t st[6] = { 0xC0000090u, 0xC0000090u, 0xC000008Eu, 0xC0000091u, 0xC0000093u, 0xC000008Fu };
     unsigned u = flags & ~(cfg >> 7) & 0x3f;
     for (unsigned i = 0; i < 6; i++) if (u & (1u << i)) return st[i];
     return 0;

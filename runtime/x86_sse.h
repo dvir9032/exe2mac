@@ -66,7 +66,9 @@ static inline void sse_flags(x86_state *s, unsigned fl) {
     unsigned unmasked = fl & um;
     if (unmasked) {
         static const uint32_t status[6] = {
-            EXE2MAC_STATUS_FLOAT_INVALID_OPERATION, EXE2MAC_STATUS_FLOAT_DENORMAL_OPERAND,
+            /* Windows reports an SSE denormal-operand fault as INVALID_OPERATION
+             * (observed: test/xm.exe case 1 -> 0xC0000090 on Windows CI) */
+            EXE2MAC_STATUS_FLOAT_INVALID_OPERATION, EXE2MAC_STATUS_FLOAT_INVALID_OPERATION,
             EXE2MAC_STATUS_FLOAT_DIVIDE_BY_ZERO, EXE2MAC_STATUS_FLOAT_OVERFLOW,
             EXE2MAC_STATUS_FLOAT_UNDERFLOW, EXE2MAC_STATUS_FLOAT_INEXACT_RESULT };
         unsigned i = 0;
