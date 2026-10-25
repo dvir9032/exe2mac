@@ -13,6 +13,10 @@
 #include "runtime/exe2mac_rt.h"
 #include "runtime/process.h"
 
+/* the bridge tests link the runtime without a generated program: no imports */
+const exe2mac_import exe2mac_imports[1] = {{0, 0, 0}};
+const unsigned exe2mac_nimports = 0;
+
 static int failures, checks;
 #define CHECK(c) do { checks++; if (!(c)) { failures++; fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #c); } } while (0)
 #define EQ(a, b) do { uint64_t _a = (uint64_t)(a), _b = (uint64_t)(b); checks++; if (_a != _b) { failures++; \
