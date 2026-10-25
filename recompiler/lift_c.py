@@ -346,9 +346,23 @@ class Lifter:
             f.emit(f"s->rip = {self.va_expr(insn.address)};")
             f.emit("t = x86_pop64(s);")
             f.emit(f.write(dst, "t"))
-        elif mn == "jmp":
-            if insn.direct_target is None:
+        elif mn == "jmp" and insn.direct_target is None:
+            jt = self.prog.jump_tables.get(insn.address)
+            if jt is None:
                 raise _err(insn, "indirect jmp")
+            (op,) = f.need(1)
+            # The table load and add already ran as ordinary instructions; only
+            # targets proven by the CFG are reachable, anything else faults.
+            f.emit(f"t = {f.read(op)};")
+            f.emit("switch (t - B) {")
+            for tgt in sorted(set(jt.targets)):
+                if tgt not in self.cur_blocks:
+                    raise _err(insn, f"jump-table target 0x{tgt:x} is not a block of this function")
+                f.emit(f"case 0x{self.rva(tgt):x}ull: goto {self.label(tgt)};")
+            f.emit(f"default: s->rip = {self.va_expr(insn.address)}; "
+                   "exe2mac_fault(s, \"jump-table target outside the analysed table\", t);")
+            f.emit("}")
+        elif mn == "jmp":
             if insn.direct_target not in self.cur_blocks:
                 raise _err(insn, "jmp leaves the current function (tail call)")
             f.emit(f"goto {self.label(insn.direct_target)};")
@@ -412,7 +426,7 @@ class Lifter:
                 lines.append(f"    goto {self.label(b.successors[0])};")
             elif b.terminator == "call_noreturn":
                 pass                                 # call emission already ends in a fault
-            elif b.terminator in ("ret", "jump", "cond"):
+            elif b.terminator in ("ret", "jump", "cond", "jump_table"):
                 pass
             else:
                 raise TranslationError(f"block 0x{start:x}: unsupported terminator {b.terminator} at 0x{last.address:x}")

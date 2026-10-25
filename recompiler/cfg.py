@@ -69,6 +69,15 @@ class CallSite:
     returns: bool = True
 
 
+@dataclass(frozen=True)
+class JumpTable:
+    jmp: int                       # address of the `jmp reg`
+    table: int                     # VA of the int32 offset table (entries are relative to it)
+    count: int                     # number of entries proven by the bounds check
+    targets: tuple[int, ...]       # entry-ordered targets (may repeat)
+    bound_check: int               # address of the guarding `cmp`
+
+
 @dataclass
 class Program:
     image_base: int
@@ -77,6 +86,7 @@ class Program:
     functions: dict[int, Function]
     call_sites: list[CallSite]
     code_pointer_roots: list[int]
+    jump_tables: dict[int, JumpTable] = field(default_factory=dict)
 
     def mnemonic_counts(self) -> dict[str, int]:
         out: dict[str, int] = {}
@@ -101,6 +111,9 @@ class Program:
                 for f in sorted(self.functions.values(), key=lambda f: f.entry)
             ],
             "call_sites": [cs.__dict__ for cs in self.call_sites],
+            "jump_tables": [{"jmp": j.jmp, "table": j.table, "count": j.count,
+                             "targets": list(j.targets), "bound_check": j.bound_check}
+                            for j in sorted(self.jump_tables.values(), key=lambda j: j.jmp)],
             "instructions": [self.instructions[a].to_dict() for a in sorted(self.instructions)],
         }
 
@@ -157,6 +170,7 @@ def discover(pe) -> Program:
     func_queue = [entry] + sorted(set(pointer_roots))
     func_roots = set(func_queue)
     call_sites: dict[int, CallSite] = {}
+    jump_tables: dict[int, JumpTable] = {}
     # per-function: map of instruction -> list of intra-procedural successors
     func_succ: dict[int, dict[int, list[int]]] = {}
     func_term: dict[int, dict[int, str]] = {}
@@ -167,6 +181,8 @@ def discover(pe) -> Program:
             continue
         succ: dict[int, list[int]] = {}
         term: dict[int, str] = {}
+        preds: dict[int, set[int]] = {}
+        func_tables: list[tuple[JumpTable, list[int]]] = []
         work = [froot]
         while work:
             va = work.pop()
@@ -186,9 +202,14 @@ def discover(pe) -> Program:
                     kind = "jump"
                 else:
                     imp = d.iat_operand(insn)
-                    if imp is None:
-                        raise CFGError(f"0x{va:x}: unresolved indirect jump '{insn.text}'")
-                    kind = "import_tailcall"
+                    if imp is not None:
+                        kind = "import_tailcall"
+                    else:
+                        jt, chain = _match_jump_table(d, insn, preds)
+                        jump_tables[va] = jt
+                        func_tables.append((jt, chain))
+                        nxt = sorted(set(jt.targets))
+                        kind = "jump_table"
             elif insn.flow == FLOW_CALL:
                 if insn.direct_target is not None:
                     call_sites[va] = CallSite(va, "direct", target=insn.direct_target)
@@ -218,7 +239,15 @@ def discover(pe) -> Program:
             succ[va] = nxt
             term[va] = kind
             for t in nxt:
+                preds.setdefault(t, set()).add(va)
                 work.append(t)
+        # The bounds proof assumed the guard -> jmp chain is entered only through
+        # the guard. Re-check now that every edge of the function is known.
+        for jt, chain in func_tables:
+            for prev, cur in zip(chain, chain[1:]):
+                if preds.get(cur, set()) != {prev}:
+                    raise CFGError(f"0x{jt.jmp:x}: jump-table sequence is entered at 0x{cur:x} "
+                                   "from outside its bounds check")
         func_succ[froot] = succ
         func_term[froot] = term
 
@@ -228,7 +257,132 @@ def discover(pe) -> Program:
 
     return Program(pe.image_base, entry, dict(sorted(d.insns.items())), functions,
                    sorted(call_sites.values(), key=lambda c: c.address),
-                   sorted(set(pointer_roots)))
+                   sorted(set(pointer_roots)), jump_tables)
+
+
+MAX_JUMP_TABLE_ENTRIES = 4096
+
+
+def _match_jump_table(d, jmp, preds):
+    """Recognise the bounded relative jump-table idiom ending at ``jmp``:
+
+        cmp  IDX, N        ; IDX is a 32- or 64-bit GPR
+        ja   default       ; (or jae -> N entries instead of N+1)
+        [mov r32, IDX32]   ; optional zero-extending copy of the index
+        lea  B, [rip+T]
+        movsxd R, dword ptr [B + I*4]
+        add  R, B          ; (or add B, R and jmp B)
+        jmp  R
+
+    The instructions are evaluated symbolically; any instruction in the chain
+    that is not one of these exact forms makes the match fail (CFGError).
+    Returns (JumpTable, chain-of-addresses-from-the-ja-to-the-jmp).
+    """
+    def fail(why):
+        return CFGError(f"0x{jmp.address:x}: unresolved indirect jump '{jmp.text}' ({why})")
+
+    op = jmp.operands[0] if jmp.operands else None
+    if op is None or op.kind != "reg" or op.reg.kind != "gpr" or op.reg.width != 64:
+        raise fail("not a jump through a 64-bit register")
+
+    chain = [jmp.address]
+    cur = jmp.address
+    guard = None
+    for _ in range(12):
+        ps = preds.get(cur, set())
+        if len(ps) != 1:
+            raise fail("no unique fall-through predecessor")
+        (p,) = ps
+        pin = d.insns[p]
+        if pin.next != cur:
+            raise fail("predecessor is a branch, not fall-through")
+        chain.insert(0, p)
+        if pin.mnemonic in ("ja", "jae"):
+            guard = pin
+            break
+        cur = p
+    if guard is None:
+        raise fail("no bounds check found")
+    gp = preds.get(guard.address, set())
+    if len(gp) != 1:
+        raise fail("bounds check has no unique predecessor")
+    (cmp_va,) = gp
+    cmp = d.insns[cmp_va]
+    if cmp.mnemonic != "cmp" or cmp.next != guard.address or len(cmp.operands) != 2:
+        raise fail("bounds check is not `cmp reg, imm` immediately before the branch")
+    idx_op, lim_op = cmp.operands
+    if idx_op.kind != "reg" or idx_op.reg.kind != "gpr" or idx_op.reg.width not in (32, 64)             or idx_op.reg.high8 or lim_op.kind != "imm":
+        raise fail("bounds check is not `cmp r32/r64, imm`")
+    limit = lim_op.imm
+    count = limit + 1 if guard.mnemonic == "ja" else limit
+    if not 0 < count <= MAX_JUMP_TABLE_ENTRIES:
+        raise fail(f"implausible table size {count}")
+
+    # symbolic register state: full-register index -> ("idx",) | ("base", T) | ("entry", T) | ("target", T)
+    sym = {}
+    if idx_op.reg.width == 64:
+        sym[idx_op.reg.index] = ("idx",)
+    idx32 = idx_op.reg.index if idx_op.reg.width == 32 else None   # zero-extension still required
+
+    def regs(insn):
+        return [o for o in insn.operands]
+
+    for va in chain[1:-1]:
+        insn = d.insns[va]
+        ops = regs(insn)
+        mn = insn.mnemonic
+        if mn == "mov" and len(ops) == 2 and all(o.kind == "reg" and o.reg.kind == "gpr" for o in ops)                 and ops[0].reg.width == ops[1].reg.width and ops[0].reg.width in (32, 64):
+            dst, src = ops
+            src_sym = sym.get(src.reg.index)
+            if dst.reg.width == 32 and idx32 is not None and src.reg.index == idx32:
+                sym[dst.reg.index] = ("idx",)          # 32-bit mov zero-extends the bounded index
+            elif dst.reg.width == 64 and src_sym is not None:
+                sym[dst.reg.index] = src_sym
+            else:
+                raise fail(f"unexpected copy at 0x{va:x}")
+            if dst.reg.index == idx32:
+                idx32 = None
+        elif mn == "lea" and len(ops) == 2 and ops[0].kind == "reg" and ops[0].reg.width == 64                 and ops[1].kind == "mem" and ops[1].mem.rip_target is not None:
+            sym[ops[0].reg.index] = ("base", ops[1].mem.rip_target)
+            if ops[0].reg.index == idx32:
+                idx32 = None
+        elif mn == "movsxd" and len(ops) == 2 and ops[0].kind == "reg" and ops[0].reg.width == 64                 and ops[1].kind == "mem" and ops[1].size == 4:
+            m = ops[1].mem
+            b = sym.get(m.base.index) if m.base is not None and m.base.kind == "gpr" else None
+            i = sym.get(m.index.index) if m.index is not None and m.index.kind == "gpr" else None
+            if not (b and b[0] == "base" and i == ("idx",) and m.scale == 4 and m.disp == 0
+                    and m.segment is None and m.index.width == 64):
+                raise fail(f"unexpected table load at 0x{va:x}")
+            sym[ops[0].reg.index] = ("entry", b[1])
+            if ops[0].reg.index == idx32:
+                idx32 = None
+        elif mn == "add" and len(ops) == 2 and all(o.kind == "reg" and o.reg.width == 64 for o in ops):
+            a, b = sym.get(ops[0].reg.index), sym.get(ops[1].reg.index)
+            pair = {a[0] if a else None, b[0] if b else None}
+            if pair != {"entry", "base"} or a[1] != b[1]:
+                raise fail(f"unexpected add at 0x{va:x}")
+            sym[ops[0].reg.index] = ("target", a[1])
+        elif mn in ("ja", "jae") and va == chain[0]:
+            continue
+        else:
+            raise fail(f"unexpected instruction '{insn.text}' at 0x{va:x}")
+
+    final = sym.get(op.reg.index)
+    if not final or final[0] != "target":
+        raise fail("jump register is not table base + table entry")
+    table = final[1]
+    targets = []
+    for k in range(count):
+        ea = table + 4 * k
+        rva = ea - d.base
+        if not (0 <= rva and rva + 4 <= len(d.pe.image)):
+            raise fail(f"table entry {k} outside the image")
+        raw = int.from_bytes(bytes(d.pe.image[rva:rva + 4]), "little", signed=True)
+        t = (table + raw) & ((1 << 64) - 1)
+        if not d.in_code(t):
+            raise fail(f"table entry {k} -> 0x{t:x} is not in an executable section")
+        targets.append(t)
+    return JumpTable(jmp.address, table, count, tuple(targets), cmp.address), [cmp.address] + chain
 
 
 def _build_blocks(froot, succ, term, insns, func_roots):
@@ -239,7 +393,7 @@ def _build_blocks(froot, succ, term, insns, func_roots):
     leaders = {froot}
     for va, nxt in succ.items():
         k = term[va]
-        if k in ("cond", "jump"):
+        if k in ("cond", "jump", "jump_table"):
             leaders.update(nxt)
         elif (k != "fallthrough" or insns[va].flow == FLOW_CALL) and insns[va].next in succ:
             # calls end their block so the return point is an explicit block start

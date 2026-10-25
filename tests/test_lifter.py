@@ -27,10 +27,10 @@ STACK_TOP = 0x10000000 + 0x100000
 RSP0 = STACK_TOP - 0x28
 
 
-def build_snippet(code_hex, td, imports=(), rdata=b""):
+def build_snippet(code_hex, td, imports=(), rdata=b"", data=b""):
     from recompiler.lift_c import Lifter
     from recompiler.cfg import discover
-    pe = FakePE(bytes.fromhex(code_hex), rdata=rdata, imports=imports)
+    pe = FakePE(bytes.fromhex(code_hex), rdata=rdata, imports=imports, data=data)
     c = os.path.join(td, "snip.gen.c")
     exe = os.path.join(td, "snip")
     with open(c, "w") as f:
@@ -45,9 +45,9 @@ def build_snippet(code_hex, td, imports=(), rdata=b""):
     return exe
 
 
-def snippet_exit_status(code_hex):
+def snippet_exit_status(code_hex, data=b""):
     with tempfile.TemporaryDirectory() as td:
-        exe = build_snippet(code_hex, td)
+        exe = build_snippet(code_hex, td, data=data)
         return subprocess.run([exe], capture_output=True, timeout=30)
 
 

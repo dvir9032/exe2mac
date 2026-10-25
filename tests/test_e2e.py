@@ -104,20 +104,26 @@ class HelloEndToEndTests(unittest.TestCase):
         print(f"\n[e2e host] {platform.system()} {platform.machine()}", end="")
 
 
-@unittest.skipUnless(CC and dec.capstone is not None, "C compiler and capstone required")
-class OpsEndToEndTests(unittest.TestCase):
-    """Second fixture (test/ops.c): movzx/movsx, shl/sar, div, setcc, adc/sbb,
-    not, xchg, rep stosb/movsb, movaps. Golden from an independent model of the
-    C semantics (test/golden/ops_model.py) and a Windows reference run in CI."""
+class _FixtureE2E:
+    """Translate, build, EXECUTE a fixture; compare stdout and exit code with a
+    golden file produced by an independent model (test/golden/<name>_model.py)
+    and confirmed by the Windows reference job in CI."""
 
-    EXE = os.path.join(ROOT, "test", "ops.exe")
-    GOLDEN = os.path.join(ROOT, "test", "golden", "ops.stdout")
-    EXIT = 102
+    NAME = None
+    EXIT = None
+
+    @property
+    def EXE(self):
+        return os.path.join(ROOT, "test", f"{self.NAME}.exe")
+
+    @property
+    def GOLDEN(self):
+        return os.path.join(ROOT, "test", "golden", f"{self.NAME}.stdout")
 
     def test_stdout_and_exit_code(self):
         from recompiler.translate import build
         with tempfile.TemporaryDirectory() as td:
-            exe = build(self.EXE, os.path.join(td, "ops"))
+            exe = build(self.EXE, os.path.join(td, self.NAME))
             res = subprocess.run([str(exe)], capture_output=True, timeout=60)
             res2 = subprocess.run([str(exe)], capture_output=True, timeout=60,
                                   env=dict(os.environ, EXE2MAC_IMAGE_BASE="7ff6a0000000"))
@@ -130,11 +136,23 @@ class OpsEndToEndTests(unittest.TestCase):
         self.assertEqual(res2.returncode, self.EXIT)
 
     def test_model_reproduces_golden(self):
-        res = subprocess.run(["python3", "-I", os.path.join(ROOT, "test", "golden", "ops_model.py")],
+        res = subprocess.run(["python3", "-I", os.path.join(ROOT, "test", "golden", f"{self.NAME}_model.py")],
                              capture_output=True, timeout=60)
         with open(self.GOLDEN, "rb") as f:
             self.assertEqual(res.stdout, f.read())
         self.assertIn(f"exit={self.EXIT}".encode(), res.stderr)
+
+
+@unittest.skipUnless(CC and dec.capstone is not None, "C compiler and capstone required")
+class OpsEndToEndTests(_FixtureE2E, unittest.TestCase):
+    """test/ops.c: movzx/movsx, shl/sar, div, setcc, adc/sbb, not, xchg, rep stosb/movsb, movaps."""
+    NAME, EXIT = "ops", 102
+
+
+@unittest.skipUnless(CC and dec.capstone is not None, "C compiler and capstone required")
+class SwitchEndToEndTests(_FixtureE2E, unittest.TestCase):
+    """test/switch.c: dense switches compiled to jump tables, plus a sparse compare tree."""
+    NAME, EXIT = "switch", 50
 
 
 @unittest.skipUnless(shutil.which("clang") and dec.capstone is not None, "clang and capstone required")

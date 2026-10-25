@@ -20,7 +20,7 @@ class _Sec:
 
 
 class FakePE:
-    def __init__(self, code: bytes, rdata: bytes = b"", imports=(), relocs=()):
+    def __init__(self, code: bytes, rdata: bytes = b"", imports=(), relocs=(), data: bytes = b""):
         self.image_base = BASE
         self.entry_rva = TEXT_RVA
         self.size_of_image = 0x4000
@@ -30,6 +30,7 @@ class FakePE:
         self.image[:2] = b"MZ"
         self.image[TEXT_RVA:TEXT_RVA + len(code)] = code
         self.image[RDATA_RVA:RDATA_RVA + len(rdata)] = rdata
+        self.image[DATA_RVA:DATA_RVA + len(data)] = data
         self.sections = [
             _Sec(".text", TEXT_RVA, len(code), 0x60000020),
             _Sec(".rdata", RDATA_RVA, max(len(rdata), 1), 0x40000040),

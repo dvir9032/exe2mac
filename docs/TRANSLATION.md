@@ -53,8 +53,17 @@ Capstone Python bindings. On macOS: Xcode Command Line Tools.
   `exe2mac_dispatch()` switches on the guest VA: known function entries call
   their translated C function; import thunk VAs run the bridge; anything else
   faults.
-* `jmp`/`jcc` → `goto` inside the C function. Indirect `jmp` (jump tables),
-  tail calls out of a function, and `ret imm16` are rejected.
+* `jmp`/`jcc` → `goto` inside the C function. Tail calls out of a function and
+  `ret imm16` are rejected.
+* Jump tables: `cfg.py` recognises the bounded relative-offset idiom
+  (`cmp idx, N; ja default; [mov r32, idx32]; lea B, [rip+T];
+  movsxd R, [B + I*4]; add R, B; jmp R`) by symbolic evaluation of exactly
+  these forms, takes the entry count from the bounds check, and reads the
+  int32 entries from the image. It verifies after discovery that no other edge
+  enters the sequence between the bounds check and the `jmp`. The translated
+  code executes the real table load and add, then `switch`es on the computed
+  guest VA over the proven targets; any other value (e.g. a table rewritten at
+  run time) faults. Any other indirect `jmp` is rejected.
 * `ExitProcess` is known not to return; code after it is not translated.
 
 ## Imports and the Windows x64 ABI bridge
@@ -91,7 +100,8 @@ Implemented exactly (defined flags computed; undefined flags left unchanged):
 Rejected with `TranslationError` (address + bytes in the message): anything else
 (e.g. `bt`, `rol/ror`, `movups` and other SSE/x87, `rep stosd`, `repne scasb`),
 LOCK prefixes, address-size override, FS/GS segment overrides, absolute
-`[disp32]` operands, one-operand `imul`, `ret imm16`, indirect `jmp`,
+`[disp32]` operands, one-operand `imul`, `ret imm16`, indirect `jmp` other than
+recognised jump tables,
 unsupported imports, code relocations.
 
 ## Fixtures
@@ -99,6 +109,7 @@ unsupported imports, code relocations.
 |---|---|---|---|
 | `test/hello.exe` | supplied | exit 7 | source-derived, confirmed on Windows CI |
 | `test/ops.exe` | `sh scripts/build_fixture.sh test/ops.c test/ops.exe` (clang + lld-link, -O2) | exit 102 | `test/golden/ops_model.py` (independent Python model of the C semantics) + Windows CI job |
+| `test/switch.exe` | `sh scripts/build_fixture.sh test/switch.c test/switch.exe` | exit 50 | `test/golden/switch_model.py` + Windows CI job |
 
 ## Verification
 * `tests/c/test_cpu.c`: SDM-derived expected values for every helper (any host).
