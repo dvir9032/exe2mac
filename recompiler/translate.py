@@ -43,10 +43,10 @@ def inventory(exe_path, start, end):
     return len(insns), Counter(i.mnem for i in insns)
 
 
-def translate(exe_path) -> str:
+def translate(exe_path, strict_indirect_jumps: bool = False) -> str:
     """Return the generated C translation unit for ``exe_path`` or raise TranslationError."""
     try:
-        return lift_program(PE(exe_path))
+        return lift_program(PE(exe_path), strict_indirect_jumps=strict_indirect_jumps)
     except (_LiftError, CFGError, DecodeError) as exc:
         raise TranslationError(str(exc)) from exc
 
@@ -74,12 +74,12 @@ def compile_c(c_path, out_path, cc=None, extra_flags=(), opt="-O2"):
     return cmd
 
 
-def build(exe_path, out_path, cc=None, extra_flags=(), keep_c=True):
+def build(exe_path, out_path, cc=None, extra_flags=(), keep_c=True, strict_indirect_jumps=False):
     """Translate ``exe_path`` and build a native executable at ``out_path``."""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     c_path = out_path.with_suffix(".gen.c") if keep_c else out_path.parent / (out_path.name + ".tmp.c")
-    c_path.write_text(translate(exe_path))
+    c_path.write_text(translate(exe_path, strict_indirect_jumps=strict_indirect_jumps))
     try:
         compile_c(c_path, out_path, cc, extra_flags)
     finally:

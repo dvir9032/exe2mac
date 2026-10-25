@@ -53,8 +53,27 @@ Capstone Python bindings. On macOS: Xcode Command Line Tools.
   `exe2mac_dispatch()` switches on the guest VA: known function entries call
   their translated C function; import thunk VAs run the bridge; anything else
   faults.
-* `jmp`/`jcc` → `goto` inside the C function. Tail calls out of a function and
-  `ret imm16` are rejected.
+* `jmp`/`jcc` → `goto` inside the C function. A direct `jmp` into another
+  function (a direct tail call) is followed by the CFG, so the target's code
+  becomes part of the current C function: mutual tail recursion turns into
+  host loops and does not grow the host stack.
+* Indirect tail calls — `jmp [IAT]`, and any indirect `jmp` that is not a
+  recognised jump table (function pointers, pointer tables) — use a
+  trampoline: the translated function stores the target in
+  `x86_state.tail` and returns; every host call site then runs pending
+  targets in a loop (`exe2mac_run_tail`). The guest stack is exactly as the
+  guest left it, so the callee's `ret` returns to the original caller, and
+  the host stack stays bounded (tested with one million chained tail calls).
+  The dispatcher faults unless the target is a known function entry or an
+  import thunk, so an unrecognised jump table fails at run time instead of
+  jumping somewhere wrong. `--strict-indirect-jumps` (CLI) /
+  `strict_indirect_jumps=True` (API) restores the translation-time rejection.
+* Function roots: entry point, direct call targets, DIR64-relocated code
+  pointers, and — as transactional *candidates* — targets of
+  `lea reg, [rip + code]`. A candidate is dropped if it is a jump-table base,
+  lies inside another instruction, does not decode into valid control flow,
+  or contains unsupported instructions; calling a dropped candidate faults.
+* `ret imm16` is rejected.
 * Jump tables: `cfg.py` recognises the bounded relative-offset idiom
   (`cmp idx, N; ja default; [mov r32, idx32]; lea B, [rip+T];
   movsxd R, [B + I*4]; add R, B; jmp R`) by symbolic evaluation of exactly
@@ -131,8 +150,8 @@ Rejected with `TranslationError` (address + bytes in the message): anything else
 (e.g. `rol/ror`, `pmaddwd`, `minps`, SSSE3/SSE4/AVX, x87, `rep stosd`,
 `repne scasb`),
 LOCK prefixes, address-size override, FS/GS segment overrides, absolute
-`[disp32]` operands, one-operand `imul`, `ret imm16`, indirect `jmp` other than
-recognised jump tables,
+`[disp32]` operands, one-operand `imul`, `ret imm16`, (with
+`--strict-indirect-jumps`) indirect `jmp` other than jump tables and IAT tail calls,
 unsupported imports, code relocations.
 
 ## Fixtures
@@ -143,6 +162,7 @@ unsupported imports, code relocations.
 | `test/switch.exe` | `sh scripts/build_fixture.sh test/switch.c test/switch.exe` | exit 50 | `test/golden/switch_model.py` + Windows CI job |
 | `test/fp.exe` | `EXTRA_CFLAGS=-fno-math-errno sh scripts/build_fixture.sh test/fp.c test/fp.exe` | exit 27 | `test/golden/fp_model.py` (SDM NaN rules) + Windows CI job |
 | `test/vec.exe` | `sh scripts/build_fixture.sh test/vec.c test/vec.exe` (auto-vectorised) | exit 42 | `test/golden/vec_model.py` + Windows CI job |
+| `test/tail.exe` | `sh scripts/build_fixture.sh test/tail.c test/tail.exe` | exit 13 | `test/golden/tail_model.py` + Windows CI job |
 | `test/io.exe` | `sh scripts/build_fixture.sh test/io.c test/io.exe` (default -O2, auto-vectorised) | exit 5 with args `alpha "b c" q\"uote "back\slash\\" ""` and stdin `test/golden/io.input` | `test/golden/io_model.py` + Windows CI job via `test/io.windows.bat` |
 
 ## Verification

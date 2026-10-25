@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .decoder import (FLOW_CALL, FLOW_COND, FLOW_JUMP, FLOW_RET, FLOW_TRAP,
-                      Instruction, decode_one)
+                      DecodeError, Instruction, decode_one)
 
 NORETURN_IMPORTS = frozenset({("kernel32.dll", "ExitProcess")})
 
@@ -87,6 +87,11 @@ class Program:
     call_sites: list[CallSite]
     code_pointer_roots: list[int]
     jump_tables: dict[int, JumpTable] = field(default_factory=dict)
+    # indirect `jmp`s that are not jump tables: translated as dynamic tail calls
+    # (VA -> why the jump-table matcher rejected them)
+    dynamic_tail_jumps: dict[int, str] = field(default_factory=dict)
+    soft_roots: set[int] = field(default_factory=set)          # accepted `lea` code-pointer roots
+    rejected_roots: dict[int, str] = field(default_factory=dict)  # `lea` targets that are not code
 
     def mnemonic_counts(self) -> dict[str, int]:
         out: dict[str, int] = {}
@@ -114,6 +119,7 @@ class Program:
             "jump_tables": [{"jmp": j.jmp, "table": j.table, "count": j.count,
                              "targets": list(j.targets), "bound_check": j.bound_check}
                             for j in sorted(self.jump_tables.values(), key=lambda j: j.jmp)],
+            "dynamic_tail_jumps": [{"jmp": va, "reason": r} for va, r in sorted(self.dynamic_tail_jumps.items())],
             "instructions": [self.instructions[a].to_dict() for a in sorted(self.instructions)],
         }
 
@@ -157,7 +163,16 @@ class _Discoverer:
         return None
 
 
-def discover(pe) -> Program:
+def discover(pe, strict_indirect_jumps: bool = False) -> Program:
+    """Discover reachable code.
+
+    An indirect ``jmp`` that is neither an IAT tail call nor a recognised jump
+    table is treated as a *dynamic tail call*: the translated code jumps to the
+    run-time target through the function dispatcher, which faults unless the
+    target is a known function entry or import. With
+    ``strict_indirect_jumps=True`` such jumps are rejected at translation time
+    instead (the pre-tail-call behaviour).
+    """
     d = _Discoverer(pe)
     entry = pe.image_base + pe.entry_rva
 
@@ -171,14 +186,19 @@ def discover(pe) -> Program:
     func_roots = set(func_queue)
     call_sites: dict[int, CallSite] = {}
     jump_tables: dict[int, JumpTable] = {}
+    dynamic_tail_jumps: dict[int, str] = {}
+    # `lea reg, [rip + code]` targets: candidate function roots, explored last
+    lea_targets: set[int] = set()
     # per-function: map of instruction -> list of intra-procedural successors
     func_succ: dict[int, dict[int, list[int]]] = {}
     func_term: dict[int, dict[int, str]] = {}
 
-    while func_queue:
-        froot = func_queue.pop(0)
-        if froot in func_succ:
-            continue
+    def add_root(va):
+        if va not in func_roots:
+            func_roots.add(va)
+            func_queue.append(va)
+
+    def explore(froot):
         succ: dict[int, list[int]] = {}
         term: dict[int, str] = {}
         preds: dict[int, set[int]] = {}
@@ -205,17 +225,22 @@ def discover(pe) -> Program:
                     if imp is not None:
                         kind = "import_tailcall"
                     else:
-                        jt, chain = _match_jump_table(d, insn, preds)
-                        jump_tables[va] = jt
-                        func_tables.append((jt, chain))
-                        nxt = sorted(set(jt.targets))
-                        kind = "jump_table"
+                        try:
+                            jt, chain = _match_jump_table(d, insn, preds)
+                        except CFGError as exc:
+                            if strict_indirect_jumps:
+                                raise
+                            dynamic_tail_jumps[va] = str(exc).split(" (", 1)[-1].rstrip(")")
+                            kind = "tailcall_dynamic"
+                        else:
+                            jump_tables[va] = jt
+                            func_tables.append((jt, chain))
+                            nxt = sorted(set(jt.targets))
+                            kind = "jump_table"
             elif insn.flow == FLOW_CALL:
                 if insn.direct_target is not None:
                     call_sites[va] = CallSite(va, "direct", target=insn.direct_target)
-                    if insn.direct_target not in func_roots:
-                        func_roots.add(insn.direct_target)
-                        func_queue.append(insn.direct_target)
+                    add_root(insn.direct_target)
                     nxt = [insn.next]
                 else:
                     imp = d.iat_operand(insn)
@@ -235,6 +260,10 @@ def discover(pe) -> Program:
             elif insn.flow == FLOW_TRAP:
                 kind = "trap"
             else:
+                if (insn.mnemonic == "lea" and len(insn.operands) == 2 and insn.operands[1].kind == "mem"
+                        and insn.operands[1].mem.rip_target is not None
+                        and d.in_code(insn.operands[1].mem.rip_target)):
+                    lea_targets.add(insn.operands[1].mem.rip_target)
                 nxt = [insn.next]
             succ[va] = nxt
             term[va] = kind
@@ -251,13 +280,54 @@ def discover(pe) -> Program:
         func_succ[froot] = succ
         func_term[froot] = term
 
+    def drain():
+        while func_queue:
+            froot = func_queue.pop(0)
+            if froot not in func_succ:
+                explore(froot)
+
+    drain()   # certain roots: any failure is a translation error
+
+    # Candidate roots from `lea [rip + code]` (function pointers). They might be
+    # data inside .text (e.g. an MSVC jump table) or a mid-function label, so
+    # each is explored in a transaction and dropped if it does not decode into
+    # valid control flow. A dropped candidate is not callable: an indirect call
+    # to it faults at run time instead of executing undecoded bytes.
+    table_bases = {j.table for j in jump_tables.values()}
+    soft_roots: set[int] = set()
+    rejected_roots: dict[int, str] = {}
+    done: set[int] = set()
+    while True:
+        pending = sorted(lea_targets - done - table_bases - set(func_succ))
+        if not pending:
+            break
+        cand = pending[0]
+        done.add(cand)
+        if cand in d.covered and d.covered[cand] != cand:
+            rejected_roots[cand] = "inside another instruction"
+            continue
+        snapshot = (dict(d.insns), dict(d.covered), dict(func_succ), dict(func_term), dict(call_sites),
+                    dict(jump_tables), dict(dynamic_tail_jumps), set(func_roots), set(lea_targets))
+        func_roots.add(cand)
+        func_queue[:] = [cand]
+        try:
+            drain()
+        except (CFGError, DecodeError) as exc:
+            (d.insns, d.covered, func_succ, func_term, call_sites, jump_tables,
+             dynamic_tail_jumps, func_roots, lea_targets) = snapshot
+            func_queue[:] = []
+            rejected_roots[cand] = str(exc)
+            continue
+        soft_roots.add(cand)
+        table_bases = {j.table for j in jump_tables.values()}
+
     functions = {}
     for froot, succ in func_succ.items():
         functions[froot] = _build_blocks(froot, succ, func_term[froot], d.insns, func_roots)
 
     return Program(pe.image_base, entry, dict(sorted(d.insns.items())), functions,
                    sorted(call_sites.values(), key=lambda c: c.address),
-                   sorted(set(pointer_roots)), jump_tables)
+                   sorted(set(pointer_roots)), jump_tables, dynamic_tail_jumps, soft_roots, rejected_roots)
 
 
 MAX_JUMP_TABLE_ENTRIES = 4096

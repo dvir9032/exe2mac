@@ -31,6 +31,8 @@ enum {
 typedef struct x86_state {
     uint64_t gpr[16];
     uint64_t rip;            /* guest VA of the current / last return target */
+    uint64_t tail;           /* pending tail-call target (valid when tail_pending) */
+    uint8_t tail_pending;    /* set by a translated tail jump, consumed by exe2mac_run_tail() */
     uint8_t cf, pf, af, zf, sf, of, df;
     struct { uint64_t lo, hi; } xmm[16];   /* SSE registers (only moves are implemented) */
     guest_mem *mem;

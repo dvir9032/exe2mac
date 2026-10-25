@@ -185,6 +185,19 @@ class VecEndToEndTests(_FixtureE2E, unittest.TestCase):
     NAME, EXIT = "vec", 42
 
 
+@unittest.skipUnless(CC and dec.capstone is not None, "C compiler and capstone required")
+class TailEndToEndTests(_FixtureE2E, unittest.TestCase):
+    """test/tail.c: direct mutual tail recursion and an indirect tail-call state
+    machine, each one million levels deep (host stack must not grow), plus tail
+    calls into imports including the no-return ExitProcess."""
+    NAME, EXIT = "tail", 13
+
+    def test_strict_mode_rejects_the_indirect_tail_calls(self):
+        from recompiler.translate import TranslationError, translate
+        with self.assertRaisesRegex(TranslationError, "unresolved indirect jump"):
+            translate(self.EXE, strict_indirect_jumps=True)
+
+
 @unittest.skipUnless(shutil.which("clang") and dec.capstone is not None, "clang and capstone required")
 class MacOSArm64CompileOnlyTests(unittest.TestCase):
     """COMPILE-ONLY check that the generated C targets arm64-apple-macos.

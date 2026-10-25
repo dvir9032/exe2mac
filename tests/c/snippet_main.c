@@ -13,6 +13,7 @@ int main(int argc, char **argv) {
     if (exe2mac_process_init(&m, argc, argv) != 0) return 125;
     uint64_t rsp0 = s.gpr[X86_RSP];
     exe2mac_dispatch(&s, s.rip);
+    exe2mac_run_tail(&s);
     if (s.rip != EXE2MAC_EXIT_SENTINEL) exe2mac_bad_return(&s, EXE2MAC_EXIT_SENTINEL);
     static const char *names[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
                                     "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"};

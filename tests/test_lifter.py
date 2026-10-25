@@ -293,6 +293,16 @@ class FailClosedLifterTests(unittest.TestCase):
         self.assertRejected("48d1c0c3", "unsupported instruction.*rol")          # rol rax, 1
         self.assertRejected("0f5dc1c3", "register xmm0 is not supported")       # minps (not implemented)
 
+    def test_unliftable_code_pointer_candidate_is_left_out_and_faults_if_called(self):
+        # lea rax, [rip + 3] ; call rax ; ret ; cpuid ; ret
+        code = "488d0503000000" "ffd0" "c3" "0fa2" "c3"
+        src = self.lift(code)
+        self.assertIn("candidate code pointer 0x14000100a not translated", src)
+        self.assertNotIn("case 0x100aull", src)
+        r = snippet_exit_status(code)
+        self.assertEqual(r.returncode, 0x01)
+        self.assertIn(b"no translated code", r.stderr)
+
     def test_unsupported_sse(self):
         self.assertRejected("f20f2dc0c3", "register xmm0 is not supported")      # cvtsd2si (rounding mode)
         self.assertRejected("660ff5c1c3", "register xmm0 is not supported")      # pmaddwd (not implemented)

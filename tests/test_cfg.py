@@ -104,14 +104,31 @@ class FixtureCFGTests(unittest.TestCase):
 
 @unittest.skipUnless(dec.capstone is not None, "capstone is required")
 class FailClosedCFGTests(unittest.TestCase):
-    def discover(self, *a, **k):
+    def discover(self, *a, strict=False, **k):
         from recompiler.cfg import discover
-        return discover(FakePE(*a, **k))
+        return discover(FakePE(*a, **k), strict_indirect_jumps=strict)
 
-    def test_indirect_jump_through_register_is_rejected(self):
+    def test_indirect_jump_through_register_is_rejected_in_strict_mode(self):
         from recompiler.cfg import CFGError
         with self.assertRaisesRegex(CFGError, "unresolved indirect jump"):
-            self.discover(bytes.fromhex("ffe0"))          # jmp rax
+            self.discover(bytes.fromhex("ffe0"), strict=True)          # jmp rax
+
+    def test_indirect_jump_is_a_dynamic_tail_call_by_default(self):
+        prog = self.discover(bytes.fromhex("ffe0"))                     # jmp rax
+        self.assertIn(BASE + 0x1000, prog.dynamic_tail_jumps)
+        blk = prog.functions[BASE + 0x1000].blocks[BASE + 0x1000]
+        self.assertEqual((blk.terminator, blk.successors), ("tailcall_dynamic", []))
+
+    def test_lea_candidate_that_is_not_code_is_dropped(self):
+        # lea rax, [rip + 1] ; ret ; 0x0f (truncated opcode at the end of .text)
+        prog = self.discover(bytes.fromhex("488d0501000000" "c3" "0f"))
+        self.assertIn(BASE + 0x1008, prog.rejected_roots)
+        self.assertNotIn(BASE + 0x1008, prog.functions)
+
+    def test_lea_of_a_code_address_creates_a_function_root(self):
+        # lea rax, [rip + 2] ; ret ; (target) ret
+        prog = self.discover(bytes.fromhex("488d0502000000" "c3" "90" "c3"))
+        self.assertIn(BASE + 0x1009, prog.functions)
 
     def test_branch_outside_code_is_rejected(self):
         from recompiler.cfg import CFGError

@@ -121,12 +121,12 @@ def make_dmg(app: Path, dmg: Path, volname: str) -> Path:
     return dmg
 
 
-def package(exe_path, out_dir, app_name=None, dmg=True, sign=True, cc=None) -> dict:
+def package(exe_path, out_dir, app_name=None, dmg=True, sign=True, cc=None, strict_indirect_jumps=False) -> dict:
     """Translate, build, and package. On non-macOS hosts only the bundle is made."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     app_name = app_name or Path(exe_path).stem.capitalize()
-    binary = build(exe_path, out_dir / "build" / _ident(app_name), cc=cc)
+    binary = build(exe_path, out_dir / "build" / _ident(app_name), cc=cc, strict_indirect_jumps=strict_indirect_jumps)
     app = make_app(binary, out_dir, app_name)
     result = {"binary": binary, "app": app, "dmg": None, "signed": False}
     on_mac = platform.system() == "Darwin"

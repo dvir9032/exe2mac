@@ -57,6 +57,22 @@ extern uint64_t g_exe2mac_base;              /* actual guest load base */
 #define EXE2MAC_STACK_SIZE    (1024u * 1024u)
 
 void exe2mac_dispatch_external(x86_state *s, uint64_t target);
+
+/* Tail calls (`jmp` to another function or an import) are a trampoline: the
+ * translated function records the target and returns to its host caller,
+ * which runs pending targets in a loop. The guest stack is exactly as the
+ * guest left it, so the callee's guest RET returns to the original caller.
+ * The host stack therefore does not grow with chains of tail calls. */
+static inline void exe2mac_tail(x86_state *s, uint64_t target) {
+    s->tail = target;
+    s->tail_pending = 1;
+}
+static inline void exe2mac_run_tail(x86_state *s) {
+    while (s->tail_pending) {
+        s->tail_pending = 0;
+        exe2mac_dispatch(s, s->tail);
+    }
+}
 _Noreturn void exe2mac_bad_return(x86_state *s, uint64_t expected);
 _Noreturn void exe2mac_noreturn_returned(x86_state *s, uint64_t call_site);
 

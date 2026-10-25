@@ -25,9 +25,9 @@ JT_RUNTIME = ("31c9488d15000000004c8d05f0ffffff4929d044890283f900771889c8488d150
               "486304824801d0ffe0b801000000c3c3")
 
 
-def discover(code_hex, data=b""):
+def discover(code_hex, data=b"", strict=False):
     from recompiler.cfg import discover as d
-    return d(FakePE(bytes.fromhex(code_hex), data=data))
+    return d(FakePE(bytes.fromhex(code_hex), data=data), strict_indirect_jumps=strict)
 
 
 def runtime_snippet():
@@ -69,17 +69,23 @@ class JumpTableCFGTests(unittest.TestCase):
     def test_missing_bounds_check_is_rejected(self):
         from recompiler.cfg import CFGError
         with self.assertRaisesRegex(CFGError, "unresolved indirect jump"):
-            discover(JT_NOBOUND)
+            discover(JT_NOBOUND, strict=True)
 
     def test_entry_that_bypasses_the_bounds_check_is_rejected(self):
         from recompiler.cfg import CFGError
         with self.assertRaisesRegex(CFGError, "unresolved indirect jump|from outside its bounds check"):
-            discover(JT_BYPASS)
+            discover(JT_BYPASS, strict=True)
+
+    def test_unrecognised_tables_become_dynamic_tail_calls_by_default(self):
+        for code in (JT_NOBOUND, JT_BYPASS, JT_NOZEXT):
+            prog = discover(code)
+            self.assertEqual(len(prog.dynamic_tail_jumps), 1)
+            self.assertEqual(prog.jump_tables, {})
 
     def test_index_without_zero_extension_is_rejected(self):
         from recompiler.cfg import CFGError
         with self.assertRaisesRegex(CFGError, "unexpected table load"):
-            discover(JT_NOZEXT)
+            discover(JT_NOZEXT, strict=True)
 
 
 @unittest.skipUnless(CC and dec.capstone is not None, "C compiler and capstone required")
@@ -87,6 +93,13 @@ class JumpTableExecutionTests(_SnippetCheck, unittest.TestCase):
     def test_in_range_and_default_paths(self):
         self.check(JT_OK, {"rbx": 102, "rsi": 999, "rax": 999, "rcx": 9, "rdx": 0},
                    {"cf": 0, "pf": 1, "af": 0, "zf": 1, "sf": 0, "of": 0})   # from `xor edx, edx`
+
+    def test_unrecognised_table_target_faults_at_run_time(self):
+        # default mode: the jmp into the middle of the function is a dynamic tail
+        # call whose target is not a function entry -> fault, never a wrong jump
+        r = snippet_exit_status(JT_NOBOUND)
+        self.assertEqual(r.returncode, 0x01)
+        self.assertIn(b"no translated code", r.stderr)
 
     def test_table_rewritten_at_run_time_faults(self):
         code, data, c0 = runtime_snippet()

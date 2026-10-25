@@ -393,10 +393,22 @@ class Lifter:
             f.emit(f"s->rip = {self.va_expr(insn.address)};")
             f.emit("t = x86_pop64(s);")
             f.emit(f.write(dst, "t"))
-        elif mn == "jmp" and insn.direct_target is None:
-            jt = self.prog.jump_tables.get(insn.address)
-            if jt is None:
+        elif mn == "jmp" and insn.direct_target is None and insn.address not in self.prog.jump_tables:
+            # tail call through the IAT or a function pointer: hand the target to the
+            # trampoline of our host caller (the guest stack is already set up)
+            (op,) = f.need(1)
+            if op.size != 8:
+                raise _err(insn, "jmp target must be 64-bit")
+            if insn.address in self.prog.dynamic_tail_jumps:
+                f.emit(f"/* dynamic tail call ({self.prog.dynamic_tail_jumps[insn.address]}) */")
+            elif self.cur_terms.get(insn.address) != "import_tailcall":
                 raise _err(insn, "indirect jmp")
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            f.emit(f"t = {f.read(op)};")
+            f.emit("exe2mac_tail(s, t);")
+            f.emit("return;")
+        elif mn == "jmp" and insn.direct_target is None:
+            jt = self.prog.jump_tables[insn.address]
             (op,) = f.need(1)
             # The table load and add already ran as ordinary instructions; only
             # targets proven by the CFG are reachable, anything else faults.
@@ -625,6 +637,7 @@ class Lifter:
                 raise _err(insn, "direct call to an undiscovered function")
             f.emit(f"x86_push64(s, {ret});")
             f.emit(f"{self.fname(insn.direct_target)}(s);")
+            f.emit("exe2mac_run_tail(s);")
         else:
             (op,) = f.need(1)
             if op.size != 8:
@@ -632,6 +645,7 @@ class Lifter:
             f.emit(f"t = {f.read(op)};")           # target is evaluated before the push
             f.emit(f"x86_push64(s, {ret});")
             f.emit("exe2mac_dispatch(s, t);")
+            f.emit("exe2mac_run_tail(s);")
         if not site.returns:
             f.emit(f"exe2mac_noreturn_returned(s, {self.va_expr(insn.address)});")
         else:
@@ -640,6 +654,7 @@ class Lifter:
     # ---- function / program emission --------------------------------------
     def lift_function(self, fn) -> list[str]:
         self.cur_blocks = fn.blocks
+        self.cur_terms = {b.instructions[-1].address: b.terminator for b in fn.blocks.values()}
         lines = [f"static void {self.fname(fn.entry)}(x86_state *s) {{",
                  "    uint64_t t, ea;",
                  "    (void)t; (void)ea;",
@@ -657,7 +672,7 @@ class Lifter:
                 lines.append(f"    goto {self.label(b.successors[0])};")
             elif b.terminator == "call_noreturn":
                 pass                                 # call emission already ends in a fault
-            elif b.terminator in ("ret", "jump", "cond", "jump_table"):
+            elif b.terminator in ("ret", "jump", "cond", "jump_table", "import_tailcall", "tailcall_dynamic"):
                 pass
             else:
                 raise TranslationError(f"block 0x{start:x}: unsupported terminator {b.terminator} at 0x{last.address:x}")
@@ -714,15 +729,28 @@ class Lifter:
              ""]
         L += self.emit_image()
         L.append("")
+        bodies, skipped = {}, {}
         for entry in sorted(self.functions):
+            try:
+                bodies[entry] = self.lift_function(self.functions[entry])
+            except TranslationError as exc:
+                # A candidate root found only through `lea [rip + code]` may be data
+                # or unsupported code that is never executed: leave it out of the
+                # dispatcher, so calling it faults. Every other function must lift.
+                if entry not in self.prog.soft_roots:
+                    raise
+                skipped[entry] = str(exc)
+        for entry, why in sorted(skipped.items()):
+            L.append(f"/* candidate code pointer 0x{entry:x} not translated: {why} */")
+        for entry in sorted(bodies):
             L.append(f"static void {self.fname(entry)}(x86_state *s);")
         L.append("")
-        for entry in sorted(self.functions):
-            L += self.lift_function(self.functions[entry])
+        for entry in sorted(bodies):
+            L += bodies[entry]
             L.append("")
         L.append("void exe2mac_dispatch(x86_state *s, uint64_t target) {")
         L.append("    switch (target - B) {")
-        for entry in sorted(self.functions):
+        for entry in sorted(bodies):
             L.append(f"    case 0x{self.rva(entry):x}ull: {self.fname(entry)}(s); return;")
         L.append("    default: exe2mac_dispatch_external(s, target); return;")
         L.append("    }")
@@ -730,6 +758,6 @@ class Lifter:
         return "\n".join(L) + "\n"
 
 
-def lift_program(pe) -> str:
+def lift_program(pe, strict_indirect_jumps: bool = False) -> str:
     """Discover reachable code and return the generated C translation unit."""
-    return Lifter(pe, discover(pe)).emit()
+    return Lifter(pe, discover(pe, strict_indirect_jumps=strict_indirect_jumps)).emit()

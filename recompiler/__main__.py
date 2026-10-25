@@ -40,11 +40,16 @@ def main(argv=None):
     k.add_argument("--no-sign", action="store_true")
     k.add_argument("--cc")
     sub.add_parser("doctor", help="check prerequisites")
+    for sp in (t, b, r, k):
+        sp.add_argument("--strict-indirect-jumps", action="store_true",
+                        help="reject indirect jmps that are not jump tables or IAT tail calls at "
+                             "translation time instead of translating them as dynamic tail calls")
     args = p.parse_args(argv)
+    strict = args.strict_indirect_jumps if hasattr(args, "strict_indirect_jumps") else False
 
     try:
         if args.cmd == "translate":
-            Path(args.output).write_text(translate(args.exe))
+            Path(args.output).write_text(translate(args.exe, strict_indirect_jumps=strict))
             return 0
         if args.cmd == "doctor":
             from .package import doctor
@@ -56,17 +61,17 @@ def main(argv=None):
         if args.cmd == "package":
             from .package import package
             res = package(args.exe, args.output, app_name=args.name, dmg=not args.no_dmg,
-                          sign=not args.no_sign, cc=args.cc)
+                          sign=not args.no_sign, cc=args.cc, strict_indirect_jumps=strict)
             print(f"app:    {res['app']}")
             print(f"signed: {res['signed']} (ad-hoc)")
             print(f"dmg:    {res['dmg'] or 'not created (needs macOS hdiutil or --no-dmg given)'}")
             return 0
         if args.cmd == "build":
-            out = build(args.exe, args.output, cc=args.cc)
+            out = build(args.exe, args.output, cc=args.cc, strict_indirect_jumps=strict)
             print(f"built {out} for {platform.system()} {platform.machine()}")
             return 0
         with tempfile.TemporaryDirectory() as td:
-            exe = build(args.exe, os.path.join(td, "guest"), cc=args.cc)
+            exe = build(args.exe, os.path.join(td, "guest"), cc=args.cc, strict_indirect_jumps=strict)
             res = subprocess.run([str(exe)], capture_output=True)
         sys.stdout.buffer.write(res.stdout)
         sys.stderr.buffer.write(res.stderr)

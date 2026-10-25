@@ -28,6 +28,7 @@ int main(int argc, char **argv) {
     if (exe2mac_process_init(&m, argc, argv) != 0) return 125;
 
     exe2mac_dispatch(&s, s.rip);
+    exe2mac_run_tail(&s);
     if (s.rip != EXE2MAC_EXIT_SENTINEL) exe2mac_bad_return(&s, EXE2MAC_EXIT_SENTINEL);
     /* Returning from the entry point ends the (only) thread; the process exit
      * code is the returned DWORD. POSIX keeps the low 8 bits. */
