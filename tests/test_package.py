@@ -52,8 +52,19 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(r.returncode, 7)
 
     def test_guest_binary_is_the_built_executable(self):
-        with open(self.res["binary"], "rb") as a, open(self.app / "Contents" / "MacOS" / "hello-guest", "rb") as b:
-            self.assertEqual(a.read(), b.read())
+        guest = self.app / "Contents" / "MacOS" / "hello-guest"
+        if not ON_MAC:
+            with open(self.res["binary"], "rb") as a, open(guest, "rb") as b:
+                self.assertEqual(a.read(), b.read())
+            return
+        # On macOS codesign rewrites the embedded signature, so bytes differ by
+        # design; check the signature and the behaviour instead.
+        r = subprocess.run(["codesign", "--verify", "--strict", str(guest)], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run([str(guest)], capture_output=True, timeout=60)
+        with open(GOLDEN, "rb") as f:
+            self.assertEqual(r.stdout, f.read())
+        self.assertEqual(r.returncode, 7)
 
     @unittest.skipUnless(ON_MAC, "macOS only")
     def test_macos_signature_and_dmg(self):
