@@ -197,6 +197,63 @@ static inline void x86_bt(x86_state *s, uint64_t a, uint64_t off, unsigned bits)
     s->cf = (uint8_t)((a >> (off & (bits - 1))) & 1);
 }
 
+/* BTS/BTR/BTC: CF = selected bit, then set / clear / complement it. Offset
+ * modulo the operand width (register and immediate forms; the lifter turns a
+ * memory bit string with a register offset into this by adjusting the
+ * address). Other flags undefined (unchanged). kind: 0 = bts, 1 = btr, 2 = btc */
+static inline uint64_t x86_btx(x86_state *s, uint64_t a, uint64_t off, unsigned bits, int kind) {
+    unsigned k = (unsigned)(off & (bits - 1));
+    uint64_t bit = (uint64_t)1 << k;
+    s->cf = (uint8_t)((a >> k) & 1);
+    a = kind == 0 ? (a | bit) : kind == 1 ? (a & ~bit) : (a ^ bit);
+    return a & x86_mask(bits);
+}
+
+/* ROL/ROR r/m, count. The count is masked to 5 bits (6 for 64-bit); 8/16-bit
+ * operands then rotate by (masked count) mod width. A masked count of 0 changes
+ * nothing; otherwise CF = LSB (rol) / MSB (ror) of the result even when the
+ * rotation itself is a multiple of the width. OF is defined only for a masked
+ * count of 1: rol MSB(r) ^ CF, ror MSB(r) ^ bit(width-2) of r; otherwise left
+ * unchanged (undefined). SF/ZF/AF/PF unchanged. */
+static inline uint64_t x86_rotate(x86_state *s, uint64_t a, uint64_t count, unsigned bits, int right) {
+    unsigned c = (unsigned)(count & (bits == 64 ? 0x3f : 0x1f));
+    a &= x86_mask(bits);
+    if (c == 0) return a;
+    unsigned r = c % bits;
+    uint64_t v = r == 0 ? a : right ? ((a >> r) | (a << (bits - r))) & x86_mask(bits)
+                                    : ((a << r) | (a >> (bits - r))) & x86_mask(bits);
+    if (right) {
+        s->cf = (uint8_t)x86_msb(v, bits);
+        if (c == 1) s->of = (uint8_t)(x86_msb(v, bits) ^ ((v >> (bits - 2)) & 1));
+    } else {
+        s->cf = (uint8_t)(v & 1);
+        if (c == 1) s->of = (uint8_t)(x86_msb(v, bits) ^ s->cf);
+    }
+    return v;
+}
+
+/* BSF/BSR: index of the lowest / highest set bit. Source 0: ZF = 1 and the
+ * destination is not written (x86 leaves it unchanged); else ZF = 0.
+ * CF/OF/SF/AF/PF undefined (unchanged). Returns 1 if the destination must be
+ * written with *out. */
+static inline int x86_bsx(x86_state *s, uint64_t a, unsigned bits, int reverse, uint64_t *out) {
+    a &= x86_mask(bits);
+    if (a == 0) { s->zf = 1; return 0; }
+    s->zf = 0;
+    unsigned i;
+    if (reverse) { i = bits - 1; while (!((a >> i) & 1)) i--; }
+    else         { i = 0; while (!((a >> i) & 1)) i++; }
+    *out = i;
+    return 1;
+}
+
+/* BSWAP r32/r64 (no flags). */
+static inline uint64_t x86_bswap(uint64_t a, unsigned bits) {
+    uint64_t r = 0;
+    for (unsigned i = 0; i < bits / 8; i++) r |= ((a >> (8 * i)) & 0xff) << (bits - 8 - 8 * i);
+    return r;
+}
+
 /* NOT: no flags. */
 static inline uint64_t x86_not(uint64_t a, unsigned bits) { return ~a & x86_mask(bits); }
 
@@ -250,9 +307,38 @@ static inline void x86_mul(x86_state *s, uint64_t src, unsigned bits) {
         x86_set(s, X86_RAX, 32, 0, p);
         x86_set(s, X86_RDX, 32, 0, p >> 32);
         s->cf = s->of = (p >> 32) != 0;
-    } else {
-        exe2mac_fault(s, "mul: unsupported operand width", bits);
+    } else {                                                  /* 8: AX = AL*src; 16: DX:AX */
+        uint64_t p = (s->gpr[X86_RAX] & x86_mask(bits)) * (src & x86_mask(bits));
+        if (bits == 8) {
+            x86_set(s, X86_RAX, 16, 0, p & 0xffff);
+        } else {
+            x86_set(s, X86_RAX, 16, 0, p & 0xffff);
+            x86_set(s, X86_RDX, 16, 0, (p >> 16) & 0xffff);
+        }
+        s->cf = s->of = (p >> bits) != 0;
     }
+}
+
+/* IMUL r/m (one operand, signed widening): AX = AL*src (8), DX:AX (16),
+ * EDX:EAX (32), RDX:RAX (64). CF = OF = high half is not the sign-extension
+ * of the low half. SF/ZF/AF/PF undefined (unchanged). */
+static inline void x86_imul1(x86_state *s, uint64_t src, unsigned bits) {
+    if (bits == 64) {
+        __int128 p = (__int128)(int64_t)s->gpr[X86_RAX] * (__int128)(int64_t)src;
+        uint64_t lo = (uint64_t)p, hi = (uint64_t)((unsigned __int128)p >> 64);
+        s->gpr[X86_RAX] = lo; s->gpr[X86_RDX] = hi;
+        s->cf = s->of = (uint8_t)(p != (__int128)(int64_t)lo);
+        return;
+    }
+    int64_t p = (int64_t)x86_sext(s->gpr[X86_RAX], bits) * (int64_t)x86_sext(src, bits);  /* |p| <= 2^62 */
+    uint64_t u = (uint64_t)p;
+    if (bits == 8) {
+        x86_set(s, X86_RAX, 16, 0, u & 0xffff);
+    } else {
+        x86_set(s, X86_RAX, bits, 0, u & x86_mask(bits));
+        x86_set(s, X86_RDX, bits, 0, (u >> bits) & x86_mask(bits));
+    }
+    s->cf = s->of = (uint8_t)((int64_t)x86_sext(u, bits) != p);
 }
 
 /* IMUL dst, src (two-operand, truncating). CF=OF = signed result did not fit.
@@ -349,6 +435,28 @@ static inline void x86_rep_stosb(x86_state *s) {
     uint8_t al = (uint8_t)s->gpr[X86_RAX];
     while (s->gpr[X86_RCX] != 0) {
         guest_st8(s->mem, s->gpr[X86_RDI], al);
+        s->gpr[X86_RDI] += step;
+        s->gpr[X86_RCX] -= 1;
+    }
+}
+/* REP STOSW/STOSD/STOSQ (size 2/4/8). Element by element, little-endian. */
+static inline void x86_rep_stos(x86_state *s, unsigned size) {
+    uint64_t step = s->df ? (uint64_t)0 - size : size;
+    uint64_t v = s->gpr[X86_RAX];
+    while (s->gpr[X86_RCX] != 0) {
+        for (unsigned i = 0; i < size; i++) guest_st8(s->mem, s->gpr[X86_RDI] + i, (uint8_t)(v >> (8 * i)));
+        s->gpr[X86_RDI] += step;
+        s->gpr[X86_RCX] -= 1;
+    }
+}
+/* REP MOVSW/MOVSD/MOVSQ (size 2/4/8): one element at a time (read, then write). */
+static inline void x86_rep_movs(x86_state *s, unsigned size) {
+    uint64_t step = s->df ? (uint64_t)0 - size : size;
+    while (s->gpr[X86_RCX] != 0) {
+        uint8_t b[8];
+        for (unsigned i = 0; i < size; i++) b[i] = guest_ld8(s->mem, s->gpr[X86_RSI] + i);
+        for (unsigned i = 0; i < size; i++) guest_st8(s->mem, s->gpr[X86_RDI] + i, b[i]);
+        s->gpr[X86_RSI] += step;
         s->gpr[X86_RDI] += step;
         s->gpr[X86_RCX] -= 1;
     }

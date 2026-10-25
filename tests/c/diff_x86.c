@@ -126,6 +126,45 @@ static uint64_t hw_##NAME(unsigned bits, uint64_t a, uint8_t c, uint64_t fin, ui
 }
 HW_SHIFT(shl, "shl")
 HW_SHIFT(sar, "sar")
+HW_SHIFT(rol, "rol")
+HW_SHIFT(ror, "ror")
+
+#define HW_BTX(NAME, INSN)                                                                 \
+static uint64_t hw_##NAME(unsigned bits, uint64_t a, uint64_t b, uint64_t fin, uint64_t *fout) { \
+    uint64_t x = a, f;                                                                     \
+    switch (bits) {                                                                        \
+    case 16: __asm__ volatile("pushq %3; popfq; " INSN "w %w2, %w0; pushfq; popq %1" : "+r"(x), "=r"(f) : "r"(b), "r"(fin) : "cc"); break; \
+    case 32: __asm__ volatile("pushq %3; popfq; " INSN "l %k2, %k0; pushfq; popq %1" : "+r"(x), "=r"(f) : "r"(b), "r"(fin) : "cc"); break; \
+    default: __asm__ volatile("pushq %3; popfq; " INSN "q %2, %0; pushfq; popq %1"   : "+r"(x), "=r"(f) : "r"(b), "r"(fin) : "cc"); break; \
+    }                                                                                      \
+    *fout = f; return x & x86_mask(bits);                                                  \
+}
+HW_BTX(bts, "bts")
+HW_BTX(btr, "btr")
+HW_BTX(btc, "btc")
+HW_BTX(bsf, "bsf")      /* dst = %0 starts as a: unchanged when the source is 0 */
+HW_BTX(bsr, "bsr")
+
+static void hw_imul1(unsigned bits, uint64_t rax, uint64_t rdx, uint64_t src, uint64_t *orax, uint64_t *ordx, uint64_t *fout) {
+    uint64_t a = rax, d = rdx, f;
+    switch (bits) {
+    case 8:  __asm__ volatile("imulb %b3; pushfq; popq %2" : "+a"(a), "+d"(d), "=r"(f) : "q"(src) : "cc"); break;
+    case 16: __asm__ volatile("imulw %w3; pushfq; popq %2" : "+a"(a), "+d"(d), "=r"(f) : "r"(src) : "cc"); break;
+    case 32: __asm__ volatile("imull %k3; pushfq; popq %2" : "+a"(a), "+d"(d), "=r"(f) : "r"(src) : "cc"); break;
+    default: __asm__ volatile("imulq %3; pushfq; popq %2"  : "+a"(a), "+d"(d), "=r"(f) : "r"(src) : "cc"); break;
+    }
+    *orax = a; *ordx = d; *fout = f;
+}
+static void hw_mul_any(unsigned bits, uint64_t rax, uint64_t rdx, uint64_t src, uint64_t *orax, uint64_t *ordx, uint64_t *fout) {
+    uint64_t a = rax, d = rdx, f;
+    switch (bits) {
+    case 8:  __asm__ volatile("mulb %b3; pushfq; popq %2" : "+a"(a), "+d"(d), "=r"(f) : "q"(src) : "cc"); break;
+    case 16: __asm__ volatile("mulw %w3; pushfq; popq %2" : "+a"(a), "+d"(d), "=r"(f) : "r"(src) : "cc"); break;
+    case 32: __asm__ volatile("mull %k3; pushfq; popq %2" : "+a"(a), "+d"(d), "=r"(f) : "r"(src) : "cc"); break;
+    default: __asm__ volatile("mulq %3; pushfq; popq %2"  : "+a"(a), "+d"(d), "=r"(f) : "r"(src) : "cc"); break;
+    }
+    *orax = a; *ordx = d; *fout = f;
+}
 
 static void hw_div(unsigned bits, uint64_t rax, uint64_t rdx, uint64_t src, uint64_t *orax, uint64_t *ordx) {
     uint64_t a = rax, d = rdx;
@@ -241,6 +280,61 @@ static void check_pair(uint64_t a, uint64_t b, uint64_t fin) {
             hr = hw_sar(bits, A, (uint8_t)c, fin, &hf);
             mr = x86_sar(&s, A, c, bits);
             cmp_result("sar", bits, A, c, fin, hr, hf, mr, &s, mask);
+        }
+        /* ROL/ROR with every count 0..70: CF defined for a non-zero masked count,
+           OF only for a masked count of 1; SF/ZF/AF/PF never change */
+        for (unsigned c = 0; c <= 70; c += (c < 10 ? 1 : 7)) {
+            unsigned eff = c & (bits == 64 ? 0x3f : 0x1f);
+            uint64_t mask = F_ALL;
+            if (eff) mask = F_PF | F_ZF | F_SF | F_AF | F_CF | (eff == 1 ? F_OF : 0);
+            load_flags(&s, fin);
+            hr = hw_rol(bits, A, (uint8_t)c, fin, &hf);
+            mr = x86_rotate(&s, A, c, bits, 0);
+            cmp_result("rol", bits, A, c, fin, hr, hf, mr, &s, mask);
+            load_flags(&s, fin);
+            hr = hw_ror(bits, A, (uint8_t)c, fin, &hf);
+            mr = x86_rotate(&s, A, c, bits, 1);
+            cmp_result("ror", bits, A, c, fin, hr, hf, mr, &s, mask);
+        }
+        /* MUL / IMUL r/m (one operand), every width: RAX and RDX in full, CF/OF */
+        {
+            uint64_t orax, ordx, rdx0 = next_rand();
+            for (int k = 0; k < 2; k++) {
+                load_flags(&s, fin);
+                s.gpr[X86_RAX] = a; s.gpr[X86_RDX] = rdx0;
+                if (k) { hw_imul1(bits, a, rdx0, B, &orax, &ordx, &hf); x86_imul1(&s, B, bits); }
+                else   { hw_mul_any(bits, a, rdx0, B, &orax, &ordx, &hf); x86_mul(&s, B, bits); }
+                cases++;
+                if (orax != s.gpr[X86_RAX] || ordx != s.gpr[X86_RDX] ||
+                    (hf & (F_CF | F_OF)) != (flags_of(&s) & (F_CF | F_OF)))
+                    report(k ? "imul1_" : "mul1_", bits, a, B, fin, orax ^ ordx, s.gpr[X86_RAX] ^ s.gpr[X86_RDX],
+                           hf, flags_of(&s), F_CF | F_OF);
+            }
+        }
+        if (bits >= 16) {
+            /* BTS/BTR/BTC reg, reg: result and CF (other flags undefined) */
+            load_flags(&s, fin); hr = hw_bts(bits, A, B, fin, &hf); mr = x86_btx(&s, A, B, bits, 0);
+            cmp_result("bts", bits, A, B, fin, hr, hf, mr, &s, F_CF);
+            load_flags(&s, fin); hr = hw_btr(bits, A, B, fin, &hf); mr = x86_btx(&s, A, B, bits, 1);
+            cmp_result("btr", bits, A, B, fin, hr, hf, mr, &s, F_CF);
+            load_flags(&s, fin); hr = hw_btc(bits, A, B, fin, &hf); mr = x86_btx(&s, A, B, bits, 2);
+            cmp_result("btc", bits, A, B, fin, hr, hf, mr, &s, F_CF);
+            /* BSF/BSR: destination (unchanged for a zero source) and ZF */
+            for (int rev = 0; rev < 2; rev++) {
+                uint64_t src = (next_rand() & 3) == 0 ? 0 : B;
+                load_flags(&s, fin);
+                hr = rev ? hw_bsr(bits, A, src, fin, &hf) : hw_bsf(bits, A, src, fin, &hf);
+                mr = A;
+                uint64_t o;
+                if (x86_bsx(&s, src, bits, rev, &o)) mr = o;
+                cmp_result(rev ? "bsr" : "bsf", bits, A, src, fin, hr, hf, mr, &s, F_ZF);
+            }
+        }
+        if (bits >= 32) {
+            uint64_t hb = A;
+            if (bits == 32) __asm__ volatile("bswapl %k0" : "+r"(hb)); else __asm__ volatile("bswapq %0" : "+r"(hb));
+            cases++;
+            if ((hb & x86_mask(bits)) != x86_bswap(A, bits)) report("bswap", bits, A, 0, 0, hb, x86_bswap(A, bits), 0, 0, 0);
         }
         if (bits >= 16) {
             /* BT reg, reg: CF from the selected bit, ZF must be unchanged */

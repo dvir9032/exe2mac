@@ -352,6 +352,64 @@ static void test_string_ops(void) {
     x86_rep_movsb(&s);
     EQ(sbuf[0x13], 0x88); EQ(sbuf[0x12], 0x77); EQ(s.gpr[X86_RDI], 0x5011);
 }
+/* Wave 3 (real-program instructions): expected values from the SDM pseudocode. */
+static void test_rotate_bitops(void) {
+    x86_state s = fresh();
+    EQ(x86_rotate(&s, 0x81, 1, 8, 0), 0x03); EQ(s.cf, 1); EQ(s.of, 1);       /* OF = MSB(r) ^ CF = 0 ^ 1 */
+    s = fresh();
+    EQ(x86_rotate(&s, 0x01, 1, 8, 1), 0x80); EQ(s.cf, 1); EQ(s.of, 1);       /* OF = MSB ^ bit6 = 1 ^ 0 */
+    s = fresh(); s.of = 1; s.zf = 1;
+    EQ(x86_rotate(&s, 0x81, 8, 8, 0), 0x81); EQ(s.cf, 1); EQ(s.of, 1); EQ(s.zf, 1);  /* rotate by 8 mod 8 = 0: CF = LSB */
+    s = fresh();
+    EQ(x86_rotate(&s, 0x80000001u, 0x21, 32, 0), 0x00000003u); EQ(s.cf, 1); /* count masked to 1 */
+    s = fresh(); s.cf = 1; s.of = 1;
+    EQ(x86_rotate(&s, 0x1234, 0, 64, 1), 0x1234); EQ(s.cf, 1); EQ(s.of, 1); /* count 0: no flag change */
+    s = fresh();
+    EQ(x86_rotate(&s, 0x8000000000000000ull, 4, 64, 0), 0x8); EQ(s.cf, 0);
+    s = fresh();
+    EQ(x86_btx(&s, 0x0, 3, 16, 0), 0x8); EQ(s.cf, 0);
+    EQ(x86_btx(&s, 0xffff, 19, 16, 1), 0xfff7); EQ(s.cf, 1);                  /* offset mod 16 = 3 */
+    EQ(x86_btx(&s, 0x10, 4, 32, 2), 0x0); EQ(s.cf, 1);
+    uint64_t o = 77;
+    s = fresh(); CHECK(x86_bsx(&s, 0x18, 32, 0, &o)); EQ(o, 3); EQ(s.zf, 0);
+    CHECK(x86_bsx(&s, 0x18, 32, 1, &o)); EQ(o, 4);
+    CHECK(x86_bsx(&s, 0x8000000000000000ull, 64, 0, &o)); EQ(o, 63);
+    o = 77; CHECK(!x86_bsx(&s, 0, 64, 1, &o)); EQ(s.zf, 1); EQ(o, 77);        /* zero: destination untouched */
+    EQ(x86_bswap(0x11223344u, 32), 0x44332211u);
+    EQ(x86_bswap(0x0102030405060708ull, 64), 0x0807060504030201ull);
+}
+static void test_widening_mul(void) {
+    x86_state s = fresh();
+    s.gpr[X86_RAX] = 0xAAAAAAAAAAAA00FEull; x86_imul1(&s, 0x03, 8);           /* -2 * 3 = -6 */
+    EQ(s.gpr[X86_RAX], 0xAAAAAAAAAAAAFFFAull); EQ(s.cf, 0); EQ(s.of, 0);
+    s.gpr[X86_RAX] = 0x40; x86_imul1(&s, 0x04, 8);                            /* 256 does not fit in int8 */
+    EQ(s.gpr[X86_RAX], 0x100); EQ(s.cf, 1); EQ(s.of, 1);
+    s.gpr[X86_RAX] = 0x8000; s.gpr[X86_RDX] = 0x7777777777777777ull; x86_imul1(&s, 2, 16);
+    EQ(s.gpr[X86_RAX], 0x0000); EQ(s.gpr[X86_RDX], 0x777777777777FFFFull); EQ(s.cf, 1);
+    s.gpr[X86_RAX] = 0x12345678FFFFFFFFull; x86_imul1(&s, 5, 32);             /* -1 * 5 */
+    EQ(s.gpr[X86_RAX], 0xFFFFFFFBu); EQ(s.gpr[X86_RDX], 0xFFFFFFFFu); EQ(s.cf, 0);
+    s.gpr[X86_RAX] = 1ull << 62; x86_imul1(&s, 4, 64);
+    EQ(s.gpr[X86_RAX], 0); EQ(s.gpr[X86_RDX], 1); EQ(s.cf, 1); EQ(s.of, 1);
+    s.gpr[X86_RAX] = 0x99999999999999FFull; x86_mul(&s, 0xFF, 8);
+    EQ(s.gpr[X86_RAX], 0x999999999999FE01ull); EQ(s.cf, 1);
+    s.gpr[X86_RAX] = 0x999999999999FFFFull; s.gpr[X86_RDX] = 0x5555555555555555ull; x86_mul(&s, 2, 16);
+    EQ(s.gpr[X86_RAX], 0x999999999999FFFEull); EQ(s.gpr[X86_RDX], 0x5555555555550001ull); EQ(s.cf, 1);
+}
+static void test_wide_string_ops(void) {
+    x86_state s = string_state();
+    memset(sbuf, 0, 0x40);
+    s.gpr[X86_RAX] = 0x1122334455667788ull; s.gpr[X86_RDI] = 0x5004; s.gpr[X86_RCX] = 2;
+    x86_rep_stos(&s, 4);
+    EQ(sbuf[4], 0x88); EQ(sbuf[7], 0x55); EQ(sbuf[8], 0x88); EQ(sbuf[11], 0x55); EQ(sbuf[12], 0);
+    EQ(s.gpr[X86_RDI], 0x500c); EQ(s.gpr[X86_RCX], 0);
+    s.df = 1; s.gpr[X86_RDI] = 0x5018; s.gpr[X86_RCX] = 1;
+    x86_rep_stos(&s, 8);
+    EQ(sbuf[0x18], 0x88); EQ(sbuf[0x1f], 0x11); EQ(s.gpr[X86_RDI], 0x5010);
+    s.df = 0; s.gpr[X86_RSI] = 0x5004; s.gpr[X86_RDI] = 0x5030; s.gpr[X86_RCX] = 3;
+    x86_rep_movs(&s, 2);
+    EQ(sbuf[0x30], 0x88); EQ(sbuf[0x33], 0x55); EQ(sbuf[0x34], 0x88); EQ(sbuf[0x35], 0x77);
+    EQ(s.gpr[X86_RSI], 0x500a); EQ(s.gpr[X86_RDI], 0x5036);
+}
 static void stos_oob(void) {
     x86_state s = string_state(); s.gpr[X86_RDI] = 0x5000 + 0x3e; s.gpr[X86_RCX] = 4; x86_rep_stosb(&s);
 }
@@ -417,6 +475,9 @@ int main(void) {
     test_bt();
     test_cdqe_cwde();
     test_new_faults();
+    test_rotate_bitops();
+    test_widening_mul();
+    test_wide_string_ops();
     printf("checks=%d failures=%d\n", checks, failures);
     return failures ? 1 : 0;
 }

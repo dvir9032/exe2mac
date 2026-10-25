@@ -320,8 +320,7 @@ class FailClosedLifterTests(unittest.TestCase):
             self.lift(code_hex, **kw)
 
     def test_unsupported_instruction(self):
-        self.assertRejected("480fa308c3", "memory bit string")                  # bt [rax], rcx
-        self.assertRejected("48d1c0c3", "unsupported instruction.*rol")          # rol rax, 1
+        self.assertRejected("48d1d0c3", "unsupported instruction.*rcl")          # rcl rax, 1
         self.assertRejected("0f5dc1c3", "register xmm0 is not supported")       # minps (not implemented)
 
     def test_unliftable_code_pointer_candidate_is_left_out_and_faults_if_called(self):
@@ -340,7 +339,7 @@ class FailClosedLifterTests(unittest.TestCase):
         self.assertRejected("0fae00c3", "unsupported instruction.*fxsave")       # fxsave [rax] (x87/SSE state save)
 
     def test_rep_prefix(self):
-        self.assertRejected("f3abc3", "REP")                                     # rep stosd (only stosb/movsb)
+        self.assertRejected("f3acc3", "REP")                                     # rep lodsb
         self.assertRejected("f2aec3", "REP")                                     # repne scasb
 
     def test_ret_imm(self):
@@ -348,9 +347,6 @@ class FailClosedLifterTests(unittest.TestCase):
 
     def test_segment_override(self):
         self.assertRejected("64488b042530000000c3", "segment override fs")     # mov rax, fs:[0x30]
-
-    def test_one_operand_imul(self):
-        self.assertRejected("48f7e9c3", "one-operand imul")
 
     def test_unsupported_import(self):
         self.assertRejected("c3", "unsupported import kernel32.dll!GetTickCount",
@@ -434,3 +430,28 @@ class CpuidTests(_SnippetCheck, unittest.TestCase):
 
     def test_unknown_leaf_reads_zero(self):
         self.check("b8070000000fa2c3", {"rax": 0, "rbx": 0, "rcx": 0, "rdx": 0})
+
+
+@unittest.skipUnless(CC and dec.capstone is not None, "C compiler and capstone required")
+class Wave3SnippetTests(_SnippetCheck, unittest.TestCase):
+    """Instructions found in real MSVC/mingw programs (Notepad2, jq)."""
+
+    def test_lock_xadd_and_cmpxchg(self):
+        # lock xadd [rsp], rax (10 + 5); lock cmpxchg [rsp], rcx succeeds (15 == rax);
+        # cmpxchg dword [rsp], ecx fails (1 != 99): EAX <- 99, flags of 1 - 99
+        code = ("4883ec1048c704240a00000048c7c005000000f0480fc10424488b1c2448c7c00f00000048c7c163000000"
+                "f0480fb10c24488b1424b8010000000fb10c244889c6488d642410c3")
+        self.check(code, {"rax": 99, "rbx": 15, "rcx": 99, "rdx": 99, "rsi": 99},
+                   {"cf": 1, "pf": 0, "af": 1, "zf": 0, "sf": 1, "of": 0})
+
+    def test_bit_string_with_register_offset(self):
+        # bts [rsp], rcx=70 -> qword +8 bit 6; lock bts [rsp+16], rcx=-1 -> qword +8 bit 63; bt reads it back
+        code = ("4883ec2048c74424080000000048c7c146000000480fab0c24488b5c240848c7c1fffffffff0480fab4c2410"
+                "488b542408480fa34c24100f92c00fb6c0488d642420c3")
+        self.check(code, {"rax": 1, "rbx": 0x40, "rcx": -1, "rdx": 0x8000000000000040}, {"cf": 1})
+
+    def test_imul1_rol_bswap_bsr_rep_stosd(self):
+        code = ("48b8000000000000004048c7c10400000048f7e94989d041b90100008041c1c10549ba0807060504030201"
+                "490fca49c7c3300000004d0fbddb4883ec104889e7b8efbeaddeb904000000f3ab4c8b642408488d642410c3")
+        self.check(code, {"rax": 0xdeadbeef, "rdx": 1, "r8": 1, "r9": 0x30, "r10": 0x0807060504030201,
+                          "r11": 5, "r12": 0xdeadbeefdeadbeef, "rdi": RSP0})

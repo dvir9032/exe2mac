@@ -44,7 +44,14 @@ FAULT_INTS = {0x29: (0xC0000409, "int 0x29: __fastfail"),              # STATUS_
 BINOPS = {"add": "x86_add", "sub": "x86_sub", "and": "x86_and", "or": "x86_or", "xor": "x86_xor",
           "adc": "x86_adc", "sbb": "x86_sbb"}
 SHIFTS = {"shr": "x86_shr", "shl": "x86_shl", "sal": "x86_shl", "sar": "x86_sar"}
-STRING_OPS = {"rep stosb": "x86_rep_stosb", "rep movsb": "x86_rep_movsb"}
+STRING_OPS = {"rep stosb": "x86_rep_stosb(s)", "rep movsb": "x86_rep_movsb(s)",
+              "rep stosw": "x86_rep_stos(s, 2)", "rep stosd": "x86_rep_stos(s, 4)", "rep stosq": "x86_rep_stos(s, 8)",
+              "rep movsw": "x86_rep_movs(s, 2)", "rep movsd": "x86_rep_movs(s, 4)", "rep movsq": "x86_rep_movs(s, 8)"}
+# LOCK-prefixed read-modify-write forms. The translated program runs one guest
+# thread, so the plain read-modify-write is atomic with respect to it.
+LOCKABLE = {"add", "sub", "and", "or", "xor", "adc", "sbb", "inc", "dec", "neg", "not",
+            "xadd", "cmpxchg", "bts", "btr", "btc", "xchg"}
+BIT_RMW = {"bts": 0, "btr": 1, "btc": 2}
 
 # ---- SSE / SSE2 ---------------------------------------------------------------
 SSE_ARITH_SD = {"addsd": "SSE_ADD", "subsd": "SSE_SUB", "mulsd": "SSE_MUL", "divsd": "SSE_DIV"}
@@ -127,6 +134,8 @@ class _Fn:
                 if op.kind == "mem" and op.mem.segment is not None and op.mem.segment.name in ("fs", "gs"):
                     raise _err(self.insn, f"segment override {op.mem.segment.name} is not supported")
             return
+        if 0xF0 in p and getattr(self, "locked", False):
+            p = [x for x in p if x != 0xF0]            # validated by the lifter: RMW on memory
         if any(x in (0xF0, 0xF2, 0xF3) for x in p):
             raise _err(self.insn, "LOCK/REP prefixes are not supported")
         for op in self.insn.operands:
@@ -254,6 +263,11 @@ class Lifter:
     def lift_insn(self, insn: Instruction, fn_entry: int, block_succ: list[int]) -> list[str]:
         f = _Fn(self, insn)
         mn = insn.mnemonic
+        if mn.startswith("lock "):
+            mn = mn[5:]
+            if mn not in LOCKABLE or not insn.operands or insn.operands[0].kind != "mem":
+                raise _err(insn, "LOCK prefix on an instruction that is not a read-modify-write of memory")
+            f.locked = True
         if mn == "nop":                     # multi-byte NOPs never access their memory operand
             return [f"/* 0x{insn.address:x}: nop */"]
         f.check_prefixes()
@@ -317,10 +331,15 @@ class Lifter:
             base, off = f.need(2)
             if base.size not in (2, 4, 8) or off.kind == "mem" or (off.kind == "reg" and off.size != base.size):
                 raise _err(insn, "invalid bt form")
-            if base.kind == "mem" and off.kind != "imm":
-                raise _err(insn, "bt with a memory bit string and register offset is not supported")
             f.emit(f"s->rip = {self.va_expr(insn.address)};")
-            f.emit(f"x86_bt(s, {f.read(base)}, {f.read(off)}, {base.bits});")
+            if base.kind == "mem" and off.kind == "reg":
+                # bit string: the (signed) register offset selects the element relative to [ea]
+                f.emit(f"t = {f.read(off)};")
+                f.emit(f"ea = {f.ea(base)} + (uint64_t)(((int64_t)x86_sext(t, {base.bits}) >> "
+                       f"{base.bits.bit_length() - 1}) * {base.size});")
+                f.emit(f"x86_bt(s, {f.read(base, 'ea')}, t, {base.bits});")
+            else:
+                f.emit(f"x86_bt(s, {f.read(base)}, {f.read(off)}, {base.bits});")
         elif mn in ("movzx", "movsx"):
             dst, src = f.need(2)
             if dst.kind != "reg" or dst.size not in (2, 4, 8) or src.size not in (1, 2) or src.size >= dst.size:
@@ -353,15 +372,17 @@ class Lifter:
             f.emit("  " + f.write(b, "t", ea_b) + " }")
         elif mn in STRING_OPS:
             f.emit(f"s->rip = {self.va_expr(insn.address)};")
-            f.emit(f"{STRING_OPS[mn]}(s);")
+            f.emit(f"{STRING_OPS[mn]};")
         elif mn == "mul":
             (src,) = f.need(1)
-            if src.size not in (4, 8):
-                raise _err(insn, "mul width")
             f.emit(f"s->rip = {self.va_expr(insn.address)};")
             f.emit(f"x86_mul(s, {f.read(src)}, {src.bits});")
         elif mn == "imul":
-            if len(ops) == 2:
+            if len(ops) == 1:
+                (src,) = ops
+                f.emit(f"s->rip = {self.va_expr(insn.address)};")
+                f.emit(f"x86_imul1(s, {f.read(src)}, {src.bits});")
+            elif len(ops) == 2:
                 dst, src = ops
                 if dst.kind != "reg" or dst.size not in (2, 4, 8) or src.size != dst.size:
                     raise _err(insn, "invalid two-operand imul")
@@ -472,6 +493,63 @@ class Lifter:
             f.emit(f"s->rip = {self.va_expr(insn.address)};")
             f.emit("s->rip = x86_pop64(s);")
             f.emit("return;")
+        elif mn in BIT_RMW:
+            base, off = f.need(2)
+            if base.size not in (2, 4, 8) or off.kind == "mem" or (off.kind == "reg" and off.size != base.size):
+                raise _err(insn, f"invalid {mn} form")
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            if base.kind == "mem" and off.kind == "reg":
+                # bit string: the (signed) register offset selects the element relative to [ea]
+                f.emit(f"t = {f.read(off)};")
+                f.emit(f"ea = {f.ea(base)} + (uint64_t)(((int64_t)x86_sext(t, {base.bits}) >> "
+                       f"{base.bits.bit_length() - 1}) * {base.size});")
+                f.emit(f"{{ uint64_t u = x86_btx(s, {f.read(base, 'ea')}, t, {base.bits}, {BIT_RMW[mn]});")
+                f.emit("  " + f.write(base, "u", "ea") + " }")
+            else:
+                e = with_ea(base)
+                f.emit(f"t = x86_btx(s, {f.read(base, e)}, {f.read(off)}, {base.bits}, {BIT_RMW[mn]});")
+                f.emit(f.write(base, "t", e))
+        elif mn in ("rol", "ror"):
+            dst, cnt = f.need(2)
+            if not (cnt.kind == "imm" or (cnt.kind == "reg" and cnt.reg.name == "cl")):
+                raise _err(insn, "rotate count must be imm8 or CL")
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            e = with_ea(dst)
+            f.emit(f"t = x86_rotate(s, {f.read(dst, e)}, {f.read(cnt)}, {dst.bits}, {int(mn == 'ror')});")
+            f.emit(f.write(dst, "t", e))
+        elif mn in ("bsf", "bsr"):
+            dst, src = f.need(2)
+            if dst.kind != "reg" or dst.size not in (2, 4, 8) or src.size != dst.size:
+                raise _err(insn, f"invalid {mn} form")
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            f.emit(f"if (x86_bsx(s, {f.read(src)}, {src.bits}, {int(mn == 'bsr')}, &t)) {{ {f.write(dst, 't')} }}")
+        elif mn == "bswap":
+            (dst,) = f.need(1)
+            if dst.kind != "reg" or dst.size not in (4, 8):
+                raise _err(insn, "invalid bswap form")
+            f.emit(f.write(dst, f"x86_bswap({f.read(dst)}, {dst.bits})"))
+        elif mn == "xadd":
+            dst, src = f.need(2)
+            if src.kind != "reg" or dst.size != src.size:
+                raise _err(insn, "invalid xadd form")
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            e = with_ea(dst)
+            f.emit(f"t = {f.read(dst, e)};")
+            f.emit(f"{{ uint64_t u = x86_add(s, t, {f.read(src)}, {dst.bits});")
+            f.emit("  " + f.write(src, "t"))           # the source receives the old destination,
+            f.emit("  " + f.write(dst, "u", e) + " }")  # then the sum is stored (xadd r, r: dst wins)
+        elif mn == "cmpxchg":
+            dst, src = f.need(2)
+            if src.kind != "reg" or dst.size != src.size:
+                raise _err(insn, "invalid cmpxchg form")
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            e = with_ea(dst)
+            f.emit(f"t = {f.read(dst, e)};")
+            f.emit(f"(void)x86_sub(s, x86_get(s, 0, {dst.bits}, 0), t, {dst.bits});")
+            f.emit(f"if (s->zf) {{ {f.write(dst, f.read(src), e)} }}")
+            # on failure the accumulator receives the destination (a memory destination is written back)
+            back = f.write(dst, "t", e) if dst.kind == "mem" else ""
+            f.emit(f"else {{ {back} x86_set(s, 0, {dst.bits}, 0, t); }}")
         elif mn == "cpuid":
             f.emit("x86_cpuid(s);")
         elif mn == "xgetbv":
