@@ -53,9 +53,17 @@ executables (no Wine, no CPU emulation at run time). First fixture:
 | Linux x86-64 (agent) | 74 tests OK (gcc and clang); translated hello: stdout byte-identical (149 B), stderr empty, exit 7; same when rebased to 0x7ff6a0000000; negative control without relocations faults (exit 5) |
 | macOS ARM64 (GitHub Actions run 40182478848, macos-14, macOS 14.8.9, Apple M1 virtual) | `Mach-O 64-bit executable arm64`; exit 7; stdout MATCH byte-for-byte (sha256 prefix 37d9bd3aed0bb630); stderr 0 B; 74 tests OK, 1 skipped (x86-only differential oracle) |
 
+8. **Task 6 – packaging.** `recompiler/package.py`, CLI `package`/`doctor`:
+   `.app` (console launcher), ad-hoc codesign, UDZO `.dmg`; CI smoke-tests the
+   app from the mounted image. A test wrongly expected byte-identical binaries
+   after codesign; fixed to check signature + behaviour.
+9. **Windows reference.** A `windows-reference` CI job runs the original
+   `hello.exe`. First attempts reported MISMATCH: the Windows checkout had
+   converted the golden file to CRLF. Fixed with `.gitattributes`. Result:
+   Windows output == golden == translated macOS output (run 40183160790).
+
 ## Open items / caveats
-- `test/golden/hello.stdout` is derived from `hello.c` (documented before the
-  translator existed), not captured on Windows.
+- Golden output now confirmed on Windows (see `test/golden/README.md`).
 - Undefined x86 flags are left unchanged (a legal outcome).
 - Unsupported (fail closed): see `docs/TRANSLATION.md` — e.g. movzx, xchg,
   shl/sar, SSE/x87, REP/LOCK, FS/GS, indirect jmp, ret imm16, other imports,
@@ -69,4 +77,6 @@ limitations), `docs/DECODER_CFG.md`, `runtime/README.md`,
 Remill Apache-2.0 used only as architectural references, no code copied).
 
 ## Next step
-Task 6: `.app` / `.dmg` packaging with a macOS smoke test in CI.
+All tasks in `prompts/TASKS.md` are complete for `hello.exe`. Natural next
+work: broaden instruction/import coverage with new fixtures (e.g. movzx, shl/sar,
+xchg, string ops), each with differential and lifted-snippet tests.

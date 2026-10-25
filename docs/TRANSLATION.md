@@ -19,6 +19,8 @@ python3 -m recompiler build     test/hello.exe -o build/hello
 python3 -m recompiler run       test/hello.exe --expect-stdout test/golden/hello.stdout --expect-exit 7
 python3 -m unittest discover -s tests -v
 sh scripts/verify_macos_arm64.sh                 # on an Apple-silicon Mac
+python3 -m recompiler package   test/hello.exe -o dist --name Hello   # .app + .dmg (macOS)
+python3 -m recompiler doctor                     # prerequisite check
 ```
 CI: `.github/workflows/macos-arm64.yml` runs the same script on GitHub's
 Apple-silicon `macos-14` runner and uploads `verify.log` and `build/`.

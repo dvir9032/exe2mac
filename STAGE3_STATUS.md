@@ -28,9 +28,16 @@ Run 40182478848 of `.github/workflows/macos-arm64.yml`, commit 044c9bd, runner `
 - tests: 74 run, OK, 1 skipped (`diff_x86.c` differential oracle needs an x86-64 CPU)
 - GNU binutils from Homebrew supported pei-x86-64, so the legacy objdump tests ran.
 
-## Still open
-- Golden stdout is source-derived, not captured on Windows (see `test/golden/README.md`).
+## Packaging (Task 6) — verified on macOS ARM64, run 40183160790
+`python3 -m recompiler package test/hello.exe -o dist --name Hello` produces
+`Hello.app` (console launcher + translated binary, ad-hoc signed,
+`codesign --verify --deep --strict` passes) and `Hello.dmg` (UDZO, `hdiutil verify`).
+Smoke test from the mounted image: exit 7, stdout MATCH, stderr empty. 79 tests OK (1 x86-only skip).
+Distribution to other Macs would additionally need Developer ID signing and notarization.
+
+## Windows reference — run 40183160790
+Original `hello.exe` on `windows-latest` (10.0.26100, x86_64): exit 7, stdout
+sha256 `37d9bd3aed0bb630037598a49e7e28780b658083cd50acf0ed9ca6ee541d34c2` = golden = translated output on macOS ARM64.
 
 ## Not implemented
-See "Limitations" in `docs/TRANSLATION.md`. Packaging (.app/.dmg) is Task 6 and
-should start only after macOS execution is verified.
+See "Limitations" in `docs/TRANSLATION.md`. 
