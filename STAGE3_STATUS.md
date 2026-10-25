@@ -39,5 +39,13 @@ Distribution to other Macs would additionally need Developer ID signing and nota
 Original `hello.exe` on `windows-latest` (10.0.26100, x86_64): exit 7, stdout
 sha256 `37d9bd3aed0bb630037598a49e7e28780b658083cd50acf0ed9ca6ee541d34c2` = golden = translated output on macOS ARM64.
 
+## Wave 2 coverage — run 40183855375 (2026-10-25)
+New fixture `test/ops.exe` (source `test/ops.c`): movzx/movsx, shl/sar, div,
+adc/sbb, not, setcc, xchg, rep stosb/movsb, movaps.
+- Windows reference (original exe): exit 102, stdout sha256 `d3a074a4…` = golden (612 bytes)
+- macOS ARM64 (macos-14): 86 tests OK (1 x86-only skip), including the ops end-to-end test
+  (stdout byte-identical, exit 102, also when rebased)
+- Linux x86-64: 86 tests OK; differential test 5,807,808 cases, 0 failures
+
 ## Not implemented
 See "Limitations" in `docs/TRANSLATION.md`. 

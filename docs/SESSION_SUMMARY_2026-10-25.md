@@ -62,6 +62,13 @@ executables (no Wine, no CPU emulation at run time). First fixture:
    converted the golden file to CRLF. Fixed with `.gitattributes`. Result:
    Windows output == golden == translated macOS output (run 40183160790).
 
+10. **Wave 2 coverage.** New fixture `test/ops.c` → `test/ops.exe` built with
+    clang + lld-link (`scripts/build_fixture.sh`). Added exact helpers, lifter forms
+    and tests for movzx/movsx, shl/sar, div, adc/sbb, not, setcc, xchg,
+    rep stosb/movsb, movaps (XMM state). Golden from an independent Python model
+    (one formatting slip in the model fixed after comparison; all values matched),
+    then confirmed by the Windows CI run (exit 102, identical sha256).
+
 ## Open items / caveats
 - Golden output now confirmed on Windows (see `test/golden/README.md`).
 - Undefined x86 flags are left unchanged (a legal outcome).
@@ -77,6 +84,5 @@ limitations), `docs/DECODER_CFG.md`, `runtime/README.md`,
 Remill Apache-2.0 used only as architectural references, no code copied).
 
 ## Next step
-All tasks in `prompts/TASKS.md` are complete for `hello.exe`. Natural next
-work: broaden instruction/import coverage with new fixtures (e.g. movzx, shl/sar,
-xchg, string ops), each with differential and lifted-snippet tests.
+Jump tables (indirect `jmp` through a table in .rdata, emitted for dense
+`switch` statements) — currently rejected by the CFG.
