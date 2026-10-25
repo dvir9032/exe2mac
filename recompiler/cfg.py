@@ -34,7 +34,11 @@ from dataclasses import dataclass, field
 from .decoder import (FLOW_CALL, FLOW_COND, FLOW_JUMP, FLOW_NONE, FLOW_RET, FLOW_TRAP,
                       DecodeError, Instruction, decode_one)
 
-NORETURN_IMPORTS = frozenset({("kernel32.dll", "ExitProcess")})
+NORETURN_IMPORTS = frozenset({("kernel32.dll", "ExitProcess")} | {
+    ("/usr/lib/libSystem.B.dylib", n) for n in (
+        "_exit", "__exit", "_abort", "___assert_rtn", "___stack_chk_fail", "_err", "_errx", "_verr", "_verrx",
+        "_longjmp", "_siglongjmp", "__longjmp", "_pthread_exit", "___cxa_throw", "___cxa_rethrow",
+        "__Unwind_Resume", "_quick_exit")})
 
 
 class CFGError(RuntimeError):
@@ -156,6 +160,18 @@ class _Discoverer:
         self.insns[va] = insn
         return insn
 
+    def stub_import(self, va):
+        """(dll, name) if `va` is a stub `jmp qword ptr [rip + import slot]`, else None."""
+        if not self.in_code(va):
+            return None
+        try:
+            insn = self.decode_at(va)
+        except Exception:                      # not decodable here: not a stub
+            return None
+        if insn.flow != FLOW_JUMP or insn.direct_target is not None:
+            return None
+        return self.iat_operand(insn)
+
     def iat_operand(self, insn):
         op = insn.operands[0] if insn.operands else None
         if op is not None and op.kind == "mem" and op.mem.rip_target is not None:
@@ -173,6 +189,8 @@ def discover(pe, strict_indirect_jumps: bool = False) -> Program:
     ``strict_indirect_jumps=True`` such jumps are rejected at translation time
     instead (the pre-tail-call behaviour).
     """
+    import sys
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), 50000))   # callee-first exploration recurses
     d = _Discoverer(pe)
     entry = pe.image_base + pe.entry_rva
 
@@ -201,7 +219,36 @@ def discover(pe, strict_indirect_jumps: bool = False) -> Program:
             func_roots.add(va)
             func_queue.append(va)
 
+    in_progress: set[int] = set()
+
+    def callee_returns(target):
+        """Whether a direct call to `target` can return. The callee is explored
+        first (recursively); a callee still being explored (recursion) is
+        assumed to return. A function returns unless every exit is a no-return
+        call, a trap, or a tail jump to a no-return import."""
+        if target in in_progress:
+            return True
+        if target not in func_succ:
+            if not d.in_code(target):
+                return True
+            func_roots.add(target)
+            explore(target)
+        insns = d.insns
+        for va, k in func_term[target].items():
+            if k in ("ret", "tailcall_dynamic"):
+                return True
+            if k == "import_tailcall" and d.iat_operand(insns[va]) not in NORETURN_IMPORTS:
+                return True
+        return False
+
     def explore(froot):
+        in_progress.add(froot)
+        try:
+            _explore(froot)
+        finally:
+            in_progress.discard(froot)
+
+    def _explore(froot):
         succ: dict[int, list[int]] = {}
         term: dict[int, str] = {}
         preds: dict[int, set[int]] = {}
@@ -268,10 +315,21 @@ def discover(pe, strict_indirect_jumps: bool = False) -> Program:
                                 nxt = sorted(set(jt.targets))
                                 kind = "jump_table"
             elif insn.flow == FLOW_CALL:
-                if insn.direct_target is not None:
-                    call_sites[va] = CallSite(va, "direct", target=insn.direct_target)
+                stub_imp = d.stub_import(insn.direct_target) if insn.direct_target is not None else None
+                if stub_imp is not None and stub_imp in NORETURN_IMPORTS:
+                    # call to a linker stub (`jmp [rip+slot]`) of a no-return import (Mach-O
+                    # __stubs, MSVC import thunks): control does not come back
+                    call_sites[va] = CallSite(va, "direct", target=insn.direct_target, returns=False)
                     add_root(insn.direct_target)
-                    nxt = [insn.next]
+                    kind = "call_noreturn"
+                elif insn.direct_target is not None:
+                    add_root(insn.direct_target)
+                    if callee_returns(insn.direct_target):
+                        call_sites[va] = CallSite(va, "direct", target=insn.direct_target)
+                        nxt = [insn.next]
+                    else:                              # e.g. a usage() that always calls exit()
+                        call_sites[va] = CallSite(va, "direct", target=insn.direct_target, returns=False)
+                        kind = "call_noreturn"
                 else:
                     imp = d.iat_operand(insn)
                     if imp is not None:
