@@ -171,11 +171,18 @@ class FpEndToEndTests(_FixtureE2E, unittest.TestCase):
 
 @unittest.skipUnless(CC and dec.capstone is not None, "C compiler and capstone required")
 class IoEndToEndTests(_FixtureE2E, unittest.TestCase):
-    """test/io.c: ReadFile(stdin), GetCommandLineA, process heap, VirtualAlloc,
-    GetLastError/SetLastError. Same arguments and input as test/io.windows.bat."""
+    """test/io.c (built with default -O2, i.e. auto-vectorised): ReadFile(stdin),
+    GetCommandLineA, process heap, VirtualAlloc, GetLastError/SetLastError.
+    Same arguments and input as test/io.windows.bat."""
     NAME, EXIT = "io", 5
     ARGS = ("alpha", "b c", 'q"uote', "back\\slash\\", "")
     STDIN = "io.input"
+
+
+@unittest.skipUnless(CC and dec.capstone is not None, "C compiler and capstone required")
+class VecEndToEndTests(_FixtureE2E, unittest.TestCase):
+    """test/vec.c: loops auto-vectorised by clang -O2 (packed SSE2 integer and FP)."""
+    NAME, EXIT = "vec", 42
 
 
 @unittest.skipUnless(shutil.which("clang") and dec.capstone is not None, "clang and capstone required")

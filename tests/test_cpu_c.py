@@ -85,6 +85,26 @@ class CRuntimeSemanticsTests(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
             self.assertIn("failures=0", run.stdout)
 
+    def test_portable_packed_sse_unit_tests(self):
+        with tempfile.TemporaryDirectory() as td:
+            exe = os.path.join(td, "test_simd")
+            r = _build_best("test_simd.c", exe)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            run = subprocess.run([exe], capture_output=True, text=True, timeout=120)
+            self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+            self.assertIn("failures=0", run.stdout)
+
+    @unittest.skipUnless(platform.machine().lower() in ("x86_64", "amd64"),
+                         "differential oracle needs an x86-64 host CPU")
+    def test_packed_sse_differential_against_host_x86_cpu(self):
+        with tempfile.TemporaryDirectory() as td:
+            exe = os.path.join(td, "diff_simd")
+            r = _build_best("diff_simd.c", exe, ["-mno-red-zone"])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            run = subprocess.run([exe], capture_output=True, text=True, timeout=900)
+            self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+            self.assertIn("failures=0", run.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

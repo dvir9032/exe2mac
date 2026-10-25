@@ -246,6 +246,35 @@ class LiftedSSETests(_SnippetCheck, unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(ROOT, "test", "fp.exe")))
 
 
+@unittest.skipUnless(CC and dec.capstone is not None, "C compiler and capstone required")
+class LiftedPackedSSETests(_SnippetCheck, unittest.TestCase):
+    """Packed SSE2 integer forms; expected values derived by hand from the SDM."""
+
+    PACKED = ("4883ec2848b80201fe007f01ff804889042448b8efcdab89674523014889442408660f6f0424660f74c9"
+              "660f6fd0660ffcd148c7c3ffffffff660fd7d866490f7ed0660f73d00466490f7ec1b802000000660f6ee0"
+              "660f6f2c24660ff3ec66490f7eea660f7034244e66490f7ef3660f6f3c24660f67ff66490f7efc4883c428c3")
+
+    def test_packed_integer_forms(self):
+        t = texts(self.PACKED)
+        for want in ("pcmpeqb xmm1, xmm1", "paddb xmm2, xmm1", "pmovmskb ebx, xmm0", "psrlq xmm0, 4",
+                     "psllq xmm5, xmm4", "pshufd xmm6, xmmword ptr [rsp], 0x4e", "packuswb xmm7, xmm7"):
+            self.assertIn(want, t)
+        self.check(self.PACKED, {
+            "rax": 2,
+            "rbx": 0xFC4,                    # sign bits of the 16 bytes; 32-bit write zero-extends
+            "r8": 0x7FFE007EFFFD0001,        # every byte - 1 (paddb with all-ones)
+            "r9": 0x080FF017F00FE010,        # psrlq by 4
+            "r10": 0x03FC05FC03F80408,       # psllq by the count in xmm4 (2)
+            "r11": 0x0123456789ABCDEF,       # pshufd 0x4e swaps the qwords
+            "r12": 0xFFFF000000FFFEFF,       # packuswb: signed words saturated to unsigned bytes
+        }, {"cf": 0, "pf": 1, "af": 0, "zf": 0, "sf": 0, "of": 0})
+
+    def test_misaligned_packed_memory_operand_faults(self):
+        r = snippet_exit_status("4883ec08660ffc4424084883c408c3")   # paddb xmm0, [rsp+8]
+        self.assertEqual(r.returncode, 0x05)
+        self.assertIn(b"misaligned 128-bit operand", r.stderr)
+
+
 @unittest.skipUnless(dec.capstone is not None, "capstone required")
 class FailClosedLifterTests(unittest.TestCase):
     def lift(self, code_hex, **kw):
@@ -262,11 +291,11 @@ class FailClosedLifterTests(unittest.TestCase):
     def test_unsupported_instruction(self):
         self.assertRejected("480fa308c3", "memory bit string")                  # bt [rax], rcx
         self.assertRejected("48d1c0c3", "unsupported instruction.*rol")          # rol rax, 1
-        self.assertRejected("0f58c1c3", "register xmm0 is not supported")       # addps (packed single)
+        self.assertRejected("0f5dc1c3", "register xmm0 is not supported")       # minps (not implemented)
 
     def test_unsupported_sse(self):
         self.assertRejected("f20f2dc0c3", "register xmm0 is not supported")      # cvtsd2si (rounding mode)
-        self.assertRejected("660f58c1c3", "register xmm0 is not supported")      # addpd (packed)
+        self.assertRejected("660ff5c1c3", "register xmm0 is not supported")      # pmaddwd (not implemented)
         self.assertRejected("0fae1424c3", "unsupported instruction.*ldmxcsr")    # MXCSR changes
 
     def test_rep_prefix(self):

@@ -12,6 +12,7 @@
 | `process.h/.c` | process heap, command line (Windows quoting), last-error value, VirtualAlloc regions |
 | `guest_heap.h/.c` | first-fit allocator for the guest heap (host-side metadata) |
 | `x86_sse.h` | scalar SSE/SSE2 semantics (bit-exact, x86 NaN rules) |
+| `x86_simd.h` | packed SSE2 semantics (lane loops) |
 | `winapi_shims.c/.h` | host POSIX implementations used by the bridges |
 | `main.c` | process start-up for a translated program |
 

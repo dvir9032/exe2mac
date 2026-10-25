@@ -49,8 +49,40 @@ SSE_BITWISE = {"xorps": "^", "xorpd": "^", "pxor": "^", "andps": "&", "andpd": "
                "orps": "|", "orpd": "|", "por": "|", "andnps": "&~", "andnpd": "&~", "pandn": "&~"}
 SSE_CMP_SD = {"cmpeqsd": 0, "cmpltsd": 1, "cmplesd": 2, "cmpunordsd": 3,
               "cmpneqsd": 4, "cmpnltsd": 5, "cmpnlesd": 6, "cmpordsd": 7}
+# Packed operations `dst = f(dst, src)` on whole XMM registers (runtime/x86_simd.h).
+def _lanes(fn, sizes):
+    return {f"{fn[0]}{suffix}": f"{fn[1]}(a, b, {bits})" for suffix, bits in sizes}
+SIMD_BINARY = {
+    **_lanes(("padd", "v_add"), (("b", 8), ("w", 16), ("d", 32), ("q", 64))),
+    **_lanes(("psub", "v_sub"), (("b", 8), ("w", 16), ("d", 32), ("q", 64))),
+    **_lanes(("pcmpeq", "v_cmpeq"), (("b", 8), ("w", 16), ("d", 32))),
+    **_lanes(("pcmpgt", "v_cmpgt"), (("b", 8), ("w", 16), ("d", 32))),
+    "pmullw": "v_mullw(a, b)", "pmuludq": "v_muludq(a, b)",
+    "pminub": "v_minmax(a, b, 8, 0, 0)", "pmaxub": "v_minmax(a, b, 8, 0, 1)",
+    "pminsw": "v_minmax(a, b, 16, 1, 0)", "pmaxsw": "v_minmax(a, b, 16, 1, 1)",
+    "packuswb": "v_pack(a, b, 16, 1)", "packsswb": "v_pack(a, b, 16, 0)", "packssdw": "v_pack(a, b, 32, 0)",
+    "punpcklbw": "v_unpack(a, b, 8, 0)", "punpckhbw": "v_unpack(a, b, 8, 1)",
+    "punpcklwd": "v_unpack(a, b, 16, 0)", "punpckhwd": "v_unpack(a, b, 16, 1)",
+    "punpckldq": "v_unpack(a, b, 32, 0)", "punpckhdq": "v_unpack(a, b, 32, 1)",
+    "punpcklqdq": "v_unpack(a, b, 64, 0)", "punpckhqdq": "v_unpack(a, b, 64, 1)",
+    "unpcklps": "v_unpack(a, b, 32, 0)", "unpckhps": "v_unpack(a, b, 32, 1)",
+    "unpcklpd": "v_unpack(a, b, 64, 0)", "unpckhpd": "v_unpack(a, b, 64, 1)",
+    "addps": "v_fp32(a, b, SSE_ADD)", "subps": "v_fp32(a, b, SSE_SUB)",
+    "mulps": "v_fp32(a, b, SSE_MUL)", "divps": "v_fp32(a, b, SSE_DIV)",
+    "addpd": "v_fp64(a, b, SSE_ADD)", "subpd": "v_fp64(a, b, SSE_SUB)",
+    "mulpd": "v_fp64(a, b, SSE_MUL)", "divpd": "v_fp64(a, b, SSE_DIV)",
+}
+SIMD_SHIFT = {"psllw": (16, 0), "pslld": (32, 0), "psllq": (64, 0),
+              "psrlw": (16, 1), "psrld": (32, 1), "psrlq": (64, 1),
+              "psraw": (16, 2), "psrad": (32, 2)}
+SIMD_BYTESHIFT = {"pslldq": 1, "psrldq": 0}
+SIMD_SHUF_IMM = {"pshufd": "v_pshufd(b, {imm}u)", "pshuflw": "v_pshuflw(b, {imm}u)",
+                 "pshufhw": "v_pshufhw(b, {imm}u)", "shufps": "v_shufps(a, b, {imm}u)"}
+SIMD_MOVMSK = {"pmovmskb": 8, "movmskps": 32, "movmskpd": 64}
+
 SSE_MNEMONICS = (set(SSE_ARITH_SD) | set(SSE_ARITH_SS) | SSE_MOV128_ALIGNED | SSE_MOV128_UNALIGNED
-                 | set(SSE_BITWISE) | set(SSE_CMP_SD)
+                 | set(SSE_BITWISE) | set(SSE_CMP_SD) | set(SIMD_BINARY) | set(SIMD_SHIFT)
+                 | set(SIMD_BYTESHIFT) | set(SIMD_SHUF_IMM) | set(SIMD_MOVMSK) | {"cvtsi2ss"}
                  | {"movsd", "movss", "movd", "movq", "sqrtsd", "minsd", "maxsd", "ucomisd", "comisd",
                     "cmpsd", "cvtsd2ss", "cvtss2sd", "cvtsi2sd", "cvttsd2si"})
 CMPOPS = {"cmp": "x86_sub", "test": "x86_and"}
@@ -524,6 +556,45 @@ class Lifter:
                 f.emit(f"  s->xmm[{d}].lo = ~s->xmm[{d}].lo & lo; s->xmm[{d}].hi = ~s->xmm[{d}].hi & hi; }}")
             else:
                 f.emit(f"  s->xmm[{d}].lo {o}= lo; s->xmm[{d}].hi {o}= hi; }}")
+        elif mn in SIMD_BINARY:                     # legacy SSE: m128 operand must be 16-byte aligned
+            dst, src = f.need(2)
+            d = xmm(dst)
+            src128(src, True)
+            f.emit(f"  v128 a = v_xmm(s, {d}), b = {{ lo, hi }};")
+            f.emit(f"  v_set_xmm(s, {d}, {SIMD_BINARY[mn]}); }}")
+        elif mn in SIMD_SHIFT:
+            dst, cnt = f.need(2)
+            d = xmm(dst)
+            bits, kind = SIMD_SHIFT[mn]
+            if cnt.kind == "imm":
+                f.emit(f"v_set_xmm(s, {d}, v_shift(v_xmm(s, {d}), {cnt.imm}u, {bits}, {kind}));")
+            else:                                   # count = low qword of xmm/m128
+                src128(cnt, True)
+                f.emit(f"  (void)hi; v_set_xmm(s, {d}, v_shift(v_xmm(s, {d}), lo, {bits}, {kind})); }}")
+        elif mn in SIMD_BYTESHIFT:
+            dst, cnt = f.need(2)
+            if cnt.kind != "imm":
+                raise _err(insn, f"{mn} count must be an immediate")
+            d = xmm(dst)
+            f.emit(f"v_set_xmm(s, {d}, v_byteshift(v_xmm(s, {d}), {cnt.imm}u, {SIMD_BYTESHIFT[mn]}));")
+        elif mn in SIMD_SHUF_IMM:
+            dst, src, imm = f.need(3)
+            if imm.kind != "imm":
+                raise _err(insn, f"{mn} needs an immediate")
+            d = xmm(dst)
+            src128(src, True)
+            f.emit(f"  v128 a = v_xmm(s, {d}), b = {{ lo, hi }}; (void)a;")
+            f.emit(f"  v_set_xmm(s, {d}, {SIMD_SHUF_IMM[mn].format(imm=imm.imm)}); }}")
+        elif mn in SIMD_MOVMSK:
+            dst, src = f.need(2)
+            if dst.kind != "reg" or dst.reg.kind != "gpr" or dst.reg.width not in (32, 64):
+                raise _err(insn, f"{mn} destination must be a 32/64-bit GPR")
+            f.emit(f.write(dst, f"v_movmsk(v_xmm(s, {xmm(src)}), {SIMD_MOVMSK[mn]})"))
+        elif mn == "cvtsi2ss":
+            dst, src = f.need(2)
+            if src.kind not in ("reg", "mem") or src.size not in (4, 8) or (src.kind == "reg" and src.reg.kind != "gpr"):
+                raise _err(insn, "cvtsi2ss source must be r/m32 or r/m64")
+            f.emit(f"xmm_set_lo32(s, {xmm(dst)}, sse_cvtsi2ss({f.read(src)}, {src.bits}));")
         elif mn == "cvtsd2ss":
             dst, src = f.need(2)
             f.emit(f"xmm_set_lo32(s, {xmm(dst)}, sse_cvtsd2ss({src64(src)}));")
@@ -637,7 +708,7 @@ class Lifter:
         L = ["/* Generated by exe2mac (static recompilation of a PE32+ x86-64 image).",
              " * Do not edit. Guest state lives in x86_state; see runtime/x86_cpu.h. */",
              '#include "runtime/exe2mac_rt.h"',
-             '#include "runtime/x86_sse.h"',
+             '#include "runtime/x86_simd.h"',
              "",
              "#define B g_exe2mac_base",
              ""]

@@ -112,14 +112,24 @@ Implemented exactly (defined flags computed; undefined flags left unchanged):
   and 16-byte alignment of legacy-SSE m128 operands (→ access violation).
   Assumes the default MXCSR (round-to-nearest, no FTZ/DAZ, exceptions masked);
   MXCSR is not modelled, so `ldmxcsr`/`stmxcsr`, `cvtsd2si` (current rounding
-  mode), packed arithmetic and x87 are rejected. Generated C is compiled with
+  mode) and x87 are rejected.
+* Packed SSE2 (`runtime/x86_simd.h`, lane loops, host-endianness independent):
+  `padd/psub b w d q`, `pcmpeq/pcmpgt b w d`, `pmullw pmuludq`,
+  `pminub pmaxub pminsw pmaxsw`, `packuswb packsswb packssdw`,
+  `punpckl/h bw wd dq qdq`, `unpckl/h ps pd`, `pshufd pshuflw pshufhw shufps`,
+  `psll/psrl w d q` and `psra w d` (imm8 or XMM count; counts ≥ lane width give
+  0 / sign fill), `pslldq psrldq`, `pmovmskb movmskps movmskpd`,
+  `add/sub/mul/div ps pd` (each lane with the scalar NaN rules), `cvtsi2ss`
+  (correctly rounded from int64 without relying on the host compiler's
+  conversion). This is enough for clang's auto-vectorised loops in
+  `test/vec.c` and `test/io.c`. Generated C is compiled with
   `-ffp-contract=off`.
 * control flow: `jcc` (all 16), `jmp rel`, `call rel/reg/mem`, `ret`,
   `nop` (any form; never touches memory)
 
 Rejected with `TranslationError` (address + bytes in the message): anything else
-(e.g. `rol/ror`, packed SSE arithmetic such as `punpcklbw`/`addps` — so
-auto-vectorised code is not yet supported —, x87, `rep stosd`, `repne scasb`),
+(e.g. `rol/ror`, `pmaddwd`, `minps`, SSSE3/SSE4/AVX, x87, `rep stosd`,
+`repne scasb`),
 LOCK prefixes, address-size override, FS/GS segment overrides, absolute
 `[disp32]` operands, one-operand `imul`, `ret imm16`, indirect `jmp` other than
 recognised jump tables,
@@ -132,12 +142,15 @@ unsupported imports, code relocations.
 | `test/ops.exe` | `sh scripts/build_fixture.sh test/ops.c test/ops.exe` (clang + lld-link, -O2) | exit 102 | `test/golden/ops_model.py` (independent Python model of the C semantics) + Windows CI job |
 | `test/switch.exe` | `sh scripts/build_fixture.sh test/switch.c test/switch.exe` | exit 50 | `test/golden/switch_model.py` + Windows CI job |
 | `test/fp.exe` | `EXTRA_CFLAGS=-fno-math-errno sh scripts/build_fixture.sh test/fp.c test/fp.exe` | exit 27 | `test/golden/fp_model.py` (SDM NaN rules) + Windows CI job |
-| `test/io.exe` | `EXTRA_CFLAGS="-fno-vectorize -fno-slp-vectorize" sh scripts/build_fixture.sh test/io.c test/io.exe` | exit 5 with args `alpha "b c" q\"uote "back\slash\\" ""` and stdin `test/golden/io.input` | `test/golden/io_model.py` + Windows CI job via `test/io.windows.bat` |
+| `test/vec.exe` | `sh scripts/build_fixture.sh test/vec.c test/vec.exe` (auto-vectorised) | exit 42 | `test/golden/vec_model.py` + Windows CI job |
+| `test/io.exe` | `sh scripts/build_fixture.sh test/io.c test/io.exe` (default -O2, auto-vectorised) | exit 5 with args `alpha "b c" q\"uote "back\slash\\" ""` and stdin `test/golden/io.input` | `test/golden/io_model.py` + Windows CI job via `test/io.windows.bat` |
 
 ## Verification
 * `tests/c/test_cpu.c`: SDM-derived expected values for every helper (any host).
 * `tests/c/test_sse.c` (portable, SDM-derived) and `tests/c/diff_sse.c`
   (8.1 M cases vs the real SSE unit, x86 hosts only).
+* `tests/c/test_simd.c` (portable) and `tests/c/diff_simd.c` (18.6 M packed
+  cases vs the real SSE2 unit), mutation-checked.
 * `tests/c/diff_x86.c`: 5.8 M cases against the real CPU (x86-64 hosts only;
   test-only oracle, never part of a translated program). Mutation-checked.
 * `tests/test_lifter.py`: lifted snippets compiled, executed, final state compared.
