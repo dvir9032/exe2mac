@@ -27,6 +27,30 @@ STACK_TOP = 0x10000000 + 0x100000
 RSP0 = STACK_TOP - 0x28
 
 
+def build_snippet(code_hex, td, imports=(), rdata=b""):
+    from recompiler.lift_c import Lifter
+    from recompiler.cfg import discover
+    pe = FakePE(bytes.fromhex(code_hex), rdata=rdata, imports=imports)
+    c = os.path.join(td, "snip.gen.c")
+    exe = os.path.join(td, "snip")
+    with open(c, "w") as f:
+        f.write(Lifter(pe, discover(pe)).emit())
+    cmd = [CC, "-std=c11", "-D_DEFAULT_SOURCE", "-O1", "-Wall", "-Wextra", "-Werror",
+           "-I", ROOT, "-I", os.path.join(ROOT, "runtime"), c,
+           os.path.join(ROOT, "tests", "c", "snippet_main.c"),
+           *[os.path.join(ROOT, "runtime", r) for r in RUNTIME], "-o", exe]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode:
+        raise AssertionError(r.stderr)
+    return exe
+
+
+def snippet_exit_status(code_hex):
+    with tempfile.TemporaryDirectory() as td:
+        exe = build_snippet(code_hex, td)
+        return subprocess.run([exe], capture_output=True, timeout=30)
+
+
 def run_snippet(code_hex, imports=(), rdata=b""):
     from recompiler.lift_c import Lifter
     from recompiler.cfg import discover
@@ -59,8 +83,7 @@ def texts(code_hex):
     return [i.text for i in dec.decode_linear(bytes.fromhex(code_hex), BASE + 0x1000)]
 
 
-@unittest.skipUnless(CC and dec.capstone is not None, "C compiler and capstone required")
-class LiftedSnippetTests(unittest.TestCase):
+class _SnippetCheck:
     def check(self, code_hex, expect_regs, expect_flags=None):
         st = run_snippet(code_hex)
         self.assertEqual(st["rsp_delta"], 8)          # entry RET popped the sentinel
@@ -72,6 +95,10 @@ class LiftedSnippetTests(unittest.TestCase):
             for k, v in expect_flags.items():
                 self.assertEqual(st[k], v, k)
 
+
+
+@unittest.skipUnless(CC and dec.capstone is not None, "C compiler and capstone required")
+class LiftedSnippetTests(_SnippetCheck, unittest.TestCase):
     def test_partial_register_writes(self):
         code = "48c7c0ffffffffb80500000048c7c3ffffffffb31248c7c1ffffffff66b90700ba3412000088f449c7c0ffffffff41b080c3"
         self.assertIn("mov ah, dh", texts(code))
@@ -127,6 +154,67 @@ class LiftedSnippetTests(unittest.TestCase):
                    {"cf": 1, "pf": 0, "af": 1, "zf": 0, "sf": 0, "of": 0})
 
 
+@unittest.skipUnless(CC and dec.capstone is not None, "C compiler and capstone required")
+class LiftedSnippetTestsWave2(_SnippetCheck, unittest.TestCase):
+    """Forms added for test/ops.exe: movzx/movsx, shl/sar, setcc, adc/sbb, not,
+    div, xchg with memory, rep stosb/movsb, movaps."""
+
+    def test_zero_and_sign_extension(self):
+        code = ("48c7c0ffffffffb9f08000000fb6c148c7c2ffffffff0fbed1480fbfd90fb7f10fb6ed4883ec08"
+                "66c70424feff4c0fbf0c24440fb65424014883c408c3")
+        t = texts(code)
+        for want in ("movzx eax, cl", "movsx edx, cl", "movsx rbx, cx", "movzx esi, cx", "movzx ebp, ch",
+                     "movsx r9, word ptr [rsp]", "movzx r10d, byte ptr [rsp + 1]"):
+            self.assertIn(want, t)
+        self.check(code, {"rax": 0xF0, "rcx": 0x80F0,
+                          "rdx": 0xFFFFFFF0,                # movsx to 32-bit zero-extends to 64
+                          "rbx": 0xFFFFFFFFFFFF80F0, "rsi": 0x80F0, "rbp": 0x80,
+                          "r9": -2, "r10": 0xFF},
+                   {"cf": 0, "pf": 1, "af": 0, "zf": 0, "sf": 0, "of": 0})
+
+    def test_shifts_setcc_carry_chain_and_not(self):
+        code = ("48b80100000000000080b14148d3e048c7c3f9ffffff48d1fb48c7c2ffffffff0f92c248c7c6ffffffff"
+                "4883c60148c7c7050000004883d70049c7c0000000004983e80149c7c10a0000004983d90349c7c2ff000000"
+                "49f7d2410f95c3c3")
+        t = texts(code)
+        for want in ("shl rax, cl", "sar rbx, 1", "setb dl", "adc rdi, 0", "sbb r9, 3", "not r10", "setne r11b"):
+            self.assertIn(want, t)
+        self.check(code, {"rax": 2,                         # 0x8000000000000001 << (65 & 63)
+                          "rcx": 65, "rbx": -4,             # -7 >> 1 rounds toward -inf
+                          "rdx": 0xFFFFFFFFFFFFFF01,        # setb dl after sar's CF=1
+                          "rsi": 0, "rdi": 6,               # adc consumes CF from add
+                          "r8": -1, "r9": 6,                # sbb consumes CF from sub
+                          "r10": 0xFFFFFFFFFFFFFF00, "r11": 1},
+                   {"cf": 0, "pf": 1, "af": 0, "zf": 0, "sf": 0, "of": 0})   # from sbb; not/setcc keep flags
+
+    def test_div_xchg_string_ops_and_movaps(self):
+        code = ("48c7c007ca9a3b31d248c7c10a00000048f7f148c7c3111100004883ec4848c704242222000048871c24"
+                "4c8b2424488d7c2408b910000000b841000000f3aa488d742408488d7c2420b903000000f3a44c8b6c2420"
+                "0f284424100f28c80f294c24304c8b7424304c8b7c24384883c448c3")
+        t = texts(code)
+        for want in ("div rcx", "xchg qword ptr [rsp], rbx", "rep stosb byte ptr [rdi], al",
+                     "rep movsb byte ptr [rdi], byte ptr [rsi]", "movaps xmm0, xmmword ptr [rsp + 0x10]",
+                     "movaps xmm1, xmm0", "movaps xmmword ptr [rsp + 0x30], xmm1"):
+            self.assertIn(want, t)
+        frame = RSP0 - 0x48
+        self.check(code, {"rax": 0x41, "rdx": 7, "rcx": 0,
+                          "rbx": 0x2222, "r12": 0x1111,
+                          "rdi": frame + 0x23, "rsi": frame + 0x0B,
+                          "r13": 0x414141,                  # 3 bytes copied by rep movsb
+                          "r14": 0x4141414141414141, "r15": 0},
+                   {"cf": 0, "pf": 1, "af": 0, "zf": 0, "sf": 0, "of": 0})
+
+    def test_misaligned_movaps_faults(self):
+        r = snippet_exit_status("4883ec080f284424084883c408c3")
+        self.assertEqual(r.returncode, 0x05)               # STATUS_ACCESS_VIOLATION & 0xff
+        self.assertIn(b"movaps: misaligned", r.stderr)
+
+    def test_unsigned_divide_by_zero_faults(self):
+        r = snippet_exit_status("31c931d2b801000000f7f1c3")
+        self.assertEqual(r.returncode, 0x94)               # STATUS_INTEGER_DIVIDE_BY_ZERO & 0xff
+        self.assertIn(b"div32: divide by zero", r.stderr)
+
+
 @unittest.skipUnless(dec.capstone is not None, "capstone required")
 class FailClosedLifterTests(unittest.TestCase):
     def lift(self, code_hex, **kw):
@@ -141,12 +229,13 @@ class FailClosedLifterTests(unittest.TestCase):
             self.lift(code_hex, **kw)
 
     def test_unsupported_instruction(self):
-        self.assertRejected("0fb64c2401c3", "unsupported instruction.*movzx")    # movzx ecx, byte [rsp+1]
-        self.assertRejected("4893c3", "unsupported instruction.*xchg")           # xchg rbx, rax
-        self.assertRejected("48d1e0c3", "unsupported instruction.*shl")          # shl rax, 1
+        self.assertRejected("480fa3c8c3", "unsupported instruction.*bt")         # bt rax, rcx
+        self.assertRejected("48d1c0c3", "unsupported instruction.*rol")          # rol rax, 1
+        self.assertRejected("0f1000c3", "register xmm0 is not supported")       # movups xmm0, [rax]
 
     def test_rep_prefix(self):
-        self.assertRejected("f3aac3", "REP")                                     # rep stosb
+        self.assertRejected("f3abc3", "REP")                                     # rep stosd (only stosb/movsb)
+        self.assertRejected("f2aec3", "REP")                                     # repne scasb
 
     def test_ret_imm(self):
         self.assertRejected("c20800", "ret imm16")

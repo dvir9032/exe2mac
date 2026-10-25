@@ -76,21 +76,33 @@ Any other import is rejected at translation time and at load time.
 ## Supported instruction forms
 Implemented exactly (defined flags computed; undefined flags left unchanged):
 
-`mov`/`movabs` (r/m ← r/m/imm, same width), `movsxd r64, r/m32`, `lea r16/32/64`,
-`add sub and or xor` (r/m, r/m/imm), `cmp test`, `inc dec neg`,
-`shr r/m, imm8|CL`, `mul r/m32|64`, `imul r, r/m` and `imul r, r/m, imm`,
-`idiv r/m32|64` (#DE → 0xC0000094 / 0xC0000095), `cdq cqo`, `cmovcc` (all 16
-conditions), `jcc` (all 16), `jmp rel`, `call rel/reg/mem`, `ret`, `push r/m64/imm`,
-`pop r64`, `nop` (any form; never touches memory).
+* data movement: `mov`/`movabs` (same width), `movsxd r64, r/m32`,
+  `movzx`/`movsx` (r16/32/64 ← r/m8/16), `lea r16/32/64`, `xchg r, r/m`,
+  `push r/m64/imm`, `pop r64`, `cmovcc` (all 16), `setcc r/m8` (all 16)
+* arithmetic/logic: `add sub adc sbb and or xor` (r/m, r/m/imm), `cmp test`,
+  `inc dec neg not`, `shl/sal shr sar` (imm8 or CL), `mul r/m32|64`,
+  `imul r, r/m` / `imul r, r/m, imm`, `div`/`idiv r/m32|64`
+  (#DE → 0xC0000094 / 0xC0000095), `cdq cqo`
+* strings: `rep stosb`, `rep movsb` (byte-exact, honours DF, overlap-safe)
+* SSE: `movaps` xmm↔m128 (16-byte alignment enforced → access violation) and xmm↔xmm
+* control flow: `jcc` (all 16), `jmp rel`, `call rel/reg/mem`, `ret`,
+  `nop` (any form; never touches memory)
 
 Rejected with `TranslationError` (address + bytes in the message): anything else
-(e.g. `movzx`, `xchg`, `shl`, `sar`, SSE/x87), LOCK/REP prefixes, address-size
-override, FS/GS segment overrides, absolute `[disp32]` operands, one-operand
-`imul`, `ret imm16`, indirect `jmp`, unsupported imports, code relocations.
+(e.g. `bt`, `rol/ror`, `movups` and other SSE/x87, `rep stosd`, `repne scasb`),
+LOCK prefixes, address-size override, FS/GS segment overrides, absolute
+`[disp32]` operands, one-operand `imul`, `ret imm16`, indirect `jmp`,
+unsupported imports, code relocations.
+
+## Fixtures
+| Fixture | Built with | Expected | Golden provenance |
+|---|---|---|---|
+| `test/hello.exe` | supplied | exit 7 | source-derived, confirmed on Windows CI |
+| `test/ops.exe` | `sh scripts/build_fixture.sh test/ops.c test/ops.exe` (clang + lld-link, -O2) | exit 102 | `test/golden/ops_model.py` (independent Python model of the C semantics) + Windows CI job |
 
 ## Verification
 * `tests/c/test_cpu.c`: SDM-derived expected values for every helper (any host).
-* `tests/c/diff_x86.c`: 2.4 M cases against the real CPU (x86-64 hosts only;
+* `tests/c/diff_x86.c`: 5.8 M cases against the real CPU (x86-64 hosts only;
   test-only oracle, never part of a translated program). Mutation-checked.
 * `tests/test_lifter.py`: lifted snippets compiled, executed, final state compared.
 * `tests/test_bridge_c.py`: ABI bridge argument/return/stack behaviour and faults.

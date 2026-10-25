@@ -263,6 +263,121 @@ static void test_memory(void) {
     EQ(child_status(stack_underflow), 0x05);
 }
 
+static void test_adc_sbb_not(void) {
+    x86_state s = fresh();
+    /* 128-bit add: low halves carry into the high halves */
+    uint64_t lo = x86_add(&s, ~0ull, 1, 64);            EQ(lo, 0); EQ(s.cf, 1);
+    EQ(x86_adc(&s, 5, 7, 64), 13);                        EQ(s.cf, 0);
+    s.cf = 1; EQ(x86_adc(&s, ~0ull, 0, 64), 0);           EQ(s.cf, 1); EQ(s.zf, 1);
+    s.cf = 1; EQ(x86_adc(&s, ~0ull, ~0ull, 64), ~0ull);   EQ(s.cf, 1); EQ(s.sf, 1);
+    s.cf = 1; EQ(x86_adc(&s, 0x7f, 0, 8), 0x80);          EQ(s.of, 1); EQ(s.af, 1);
+    /* 128-bit subtract */
+    lo = x86_sub(&s, 0, 1, 64);                           EQ(lo, ~0ull); EQ(s.cf, 1);
+    EQ(x86_sbb(&s, 10, 3, 64), 6);                        EQ(s.cf, 0);
+    s.cf = 1; EQ(x86_sbb(&s, 5, 5, 64), ~0ull);           EQ(s.cf, 1); EQ(s.sf, 1);
+    s.cf = 1; EQ(x86_sbb(&s, 0, ~0ull, 64), 0);           EQ(s.cf, 1); EQ(s.zf, 1);
+    s.cf = 0; EQ(x86_sbb(&s, 0x80, 1, 8), 0x7f);          EQ(s.of, 1);
+    s.cf = 1; s.zf = 1;
+    EQ(x86_not(0x00ff00ff00ff00ffull, 64), 0xff00ff00ff00ff00ull); EQ(s.cf, 1); EQ(s.zf, 1);
+    EQ(x86_not(0x12, 8), 0xed);
+}
+
+static void test_shl_sar(void) {
+    x86_state s = fresh();
+    s.cf = 1; s.of = 1; s.zf = 1;
+    EQ(x86_shl(&s, 0x1234, 0, 64), 0x1234);   EQ(s.cf, 1); EQ(s.of, 1); EQ(s.zf, 1);
+    EQ(x86_shl(&s, 0x8000000000000001ull, 1, 64), 2);  EQ(s.cf, 1); EQ(s.of, 1);  /* MSB(r)=0 ^ CF=1 */
+    EQ(x86_shl(&s, 0x4000000000000000ull, 1, 64), 0x8000000000000000ull); EQ(s.cf, 0); EQ(s.of, 1); EQ(s.sf, 1);
+    EQ(x86_shl(&s, 0x8000000000000001ull, 63, 64), 0x8000000000000000ull); EQ(s.cf, 0);
+    EQ(x86_shl(&s, 0x8000000000000001ull, 64, 64), 0x8000000000000001ull);  /* count & 63 == 0 */
+    EQ(x86_shl(&s, 0x81, 1, 8), 0x02);         EQ(s.cf, 1);
+    EQ(x86_shl(&s, 0x01, 8, 8), 0x00);         EQ(s.cf, 1); EQ(s.zf, 1);    /* last bit out is bit 0 */
+    EQ(x86_shl(&s, 0xdeadbeef, 33, 32), 0xbd5b7dde); EQ(s.cf, 1);           /* count & 31 == 1 */
+
+    EQ(x86_sar(&s, 0xfffffff16bab0000ull, 0, 64), 0xfffffff16bab0000ull);
+    EQ(x86_sar(&s, (uint64_t)-1000000000000LL, 1, 64), (uint64_t)-500000000000LL); EQ(s.of, 0); EQ(s.cf, 0);
+    EQ(x86_sar(&s, (uint64_t)-1000000000000LL, 63, 64), ~0ull); EQ(s.cf, 1);
+    EQ(x86_sar(&s, (uint64_t)-1LL, 7, 64), ~0ull);  EQ(s.cf, 1);
+    EQ(x86_sar(&s, (uint64_t)-7LL, 1, 64), (uint64_t)-4LL); EQ(s.cf, 1);       /* rounds toward -inf */
+    EQ(x86_sar(&s, 0x7fffffffffffffffull, 62, 64), 1); EQ(s.cf, 1); EQ(s.sf, 0);
+    EQ(x86_sar(&s, 0x80, 1, 8), 0xc0);          EQ(s.sf, 1); EQ(s.cf, 0);
+    EQ(x86_sar(&s, 0x80, 20, 8), 0xff);         /* 8-bit, count 20 < 32: all sign bits */
+    EQ(x86_sar(&s, 0x80000000, 31, 32), 0xffffffff);
+}
+
+static void test_div(void) {
+    x86_state s = fresh();
+    s.gpr[X86_RAX] = 1000000007; s.gpr[X86_RDX] = 0;
+    x86_div(&s, 10, 64);                         EQ(s.gpr[X86_RAX], 100000000); EQ(s.gpr[X86_RDX], 7);
+    s.gpr[X86_RAX] = ~0ull; s.gpr[X86_RDX] = 0;
+    x86_div(&s, 3, 64);                          EQ(s.gpr[X86_RAX], 0x5555555555555555ull); EQ(s.gpr[X86_RDX], 0);
+    s.gpr[X86_RAX] = 0; s.gpr[X86_RDX] = 1;      /* 2^64 / 2 */
+    x86_div(&s, 2, 64);                          EQ(s.gpr[X86_RAX], 0x8000000000000000ull); EQ(s.gpr[X86_RDX], 0);
+    s.gpr[X86_RAX] = 0xffffffff00000007ull; s.gpr[X86_RDX] = 0xabcdabcd00000000ull;  /* upper halves ignored */
+    x86_div(&s, 0x100000002ull, 32);             EQ(s.gpr[X86_RAX], 3); EQ(s.gpr[X86_RDX], 1);
+}
+static void udiv_zero(void) { x86_state s = fresh(); s.gpr[X86_RAX] = 5; x86_div(&s, 0, 64); }
+static void udiv_overflow(void) { x86_state s = fresh(); s.gpr[X86_RDX] = 3; x86_div(&s, 3, 64); }
+static void udiv_overflow32(void) { x86_state s = fresh(); s.gpr[X86_RDX] = 1; x86_div(&s, 1, 32); }
+
+static uint8_t sbuf[0x40];
+static guest_mem smem;
+static x86_state string_state(void) {
+    memset(&smem, 0, sizeof smem);
+    memset(sbuf, 0, sizeof sbuf);
+    guest_map(&smem, 0x5000, sizeof sbuf, sbuf, GUEST_PERM_R | GUEST_PERM_W, "buf");
+    x86_state s = fresh();
+    s.mem = &smem;
+    return s;
+}
+
+static void test_string_ops(void) {
+    x86_state s = string_state();
+    s.gpr[X86_RAX] = 0x1234; s.gpr[X86_RDI] = 0x5004; s.gpr[X86_RCX] = 8;
+    s.zf = 1; s.cf = 1;
+    x86_rep_stosb(&s);
+    EQ(s.gpr[X86_RCX], 0); EQ(s.gpr[X86_RDI], 0x500c); EQ(s.zf, 1); EQ(s.cf, 1);
+    EQ(sbuf[3], 0); EQ(sbuf[4], 0x34); EQ(sbuf[11], 0x34); EQ(sbuf[12], 0);
+    /* RCX == 0: nothing happens, no memory touched */
+    s.gpr[X86_RDI] = 0xdead0000; x86_rep_stosb(&s); EQ(s.gpr[X86_RDI], 0xdead0000);
+    /* overlapping forward copy replicates the first byte, exactly like hardware */
+    for (int i = 0; i < 8; i++) sbuf[0x20 + i] = (uint8_t)('a' + i);
+    s.gpr[X86_RSI] = 0x5020; s.gpr[X86_RDI] = 0x5021; s.gpr[X86_RCX] = 4;
+    x86_rep_movsb(&s);
+    EQ(sbuf[0x21], 'a'); EQ(sbuf[0x24], 'a'); EQ(sbuf[0x25], 'f');
+    EQ(s.gpr[X86_RSI], 0x5024); EQ(s.gpr[X86_RDI], 0x5025); EQ(s.gpr[X86_RCX], 0);
+    /* DF=1 copies backwards */
+    s.df = 1; s.gpr[X86_RSI] = 0x5003; s.gpr[X86_RDI] = 0x5013; s.gpr[X86_RCX] = 2;
+    sbuf[2] = 0x77; sbuf[3] = 0x88;
+    x86_rep_movsb(&s);
+    EQ(sbuf[0x13], 0x88); EQ(sbuf[0x12], 0x77); EQ(s.gpr[X86_RDI], 0x5011);
+}
+static void stos_oob(void) {
+    x86_state s = string_state(); s.gpr[X86_RDI] = 0x5000 + 0x3e; s.gpr[X86_RCX] = 4; x86_rep_stosb(&s);
+}
+
+static void test_movaps(void) {
+    x86_state s = string_state();
+    for (int i = 0; i < 16; i++) sbuf[i] = (uint8_t)(0xa0 + i);
+    x86_ld128(&s, 3, 0x5000, 1);
+    EQ(s.xmm[3].lo, 0xa7a6a5a4a3a2a1a0ull); EQ(s.xmm[3].hi, 0xafaeadacabaaa9a8ull);
+    x86_st128(&s, 3, 0x5010, 1);
+    CHECK(memcmp(sbuf, sbuf + 0x10, 16) == 0);
+    x86_ld128(&s, 4, 0x5001, 0);                 /* unaligned allowed when not required */
+    EQ(s.xmm[4].lo & 0xff, 0xa1);
+}
+static void movaps_misaligned(void) { x86_state s = string_state(); x86_ld128(&s, 0, 0x5008, 1); }
+static void movaps_partial_oob(void) { x86_state s = string_state(); x86_st128(&s, 0, 0x5030 + 0x10 - 8, 0); }
+
+static void test_new_faults(void) {
+    EQ(child_status(udiv_zero), 0x94);
+    EQ(child_status(udiv_overflow), 0x95);
+    EQ(child_status(udiv_overflow32), 0x95);
+    EQ(child_status(stos_oob), 0x05);
+    EQ(child_status(movaps_misaligned), 0x05);
+    EQ(child_status(movaps_partial_oob), 0x05);
+}
+
 int main(void) {
     test_registers();
     test_parity_low_byte_only();
@@ -275,6 +390,12 @@ int main(void) {
     test_div_faults();
     test_conditions();
     test_memory();
+    test_adc_sbb_not();
+    test_shl_sar();
+    test_div();
+    test_string_ops();
+    test_movaps();
+    test_new_faults();
     printf("checks=%d failures=%d\n", checks, failures);
     return failures ? 1 : 0;
 }

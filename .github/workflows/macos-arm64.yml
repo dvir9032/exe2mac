@@ -116,17 +116,21 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
-      - name: Run the original hello.exe and compare with the golden file
+      - name: Run the original fixtures and compare with the golden files
         run: |
-          set +e
-          ./test/hello.exe > win.stdout 2> win.stderr
-          code=$?
-          set -e
-          echo "cmp available: $(command -v cmp || echo no)"
-          h_win=$(sha256sum < win.stdout | cut -d' ' -f1)
-          h_gold=$(sha256sum < test/golden/hello.stdout | cut -d' ' -f1)
-          same=MISMATCH; [ "$h_win" = "$h_gold" ] && same=MATCH
           ver="$(cmd.exe //c ver | tr -d '\r' | tr -s '\n' ' ')"
-          echo "::notice title=windows-reference::host=$ver $(uname -m) | exit=$code | stdout=$same | bytes=$(wc -c < win.stdout | tr -d ' ') | sha256=$h_win golden=$h_gold | cmp=$(command -v cmp || echo none) | stderr_bytes=$(wc -c < win.stderr | tr -d ' ')"
-          od -c win.stdout | head -20
-          [ "$code" -eq 7 ] && [ "$same" = MATCH ]
+          status=0
+          for spec in hello:7 ops:102; do
+            name=${spec%%:*}; want=${spec##*:}
+            set +e
+            ./test/$name.exe > $name.win.stdout 2> $name.win.stderr
+            code=$?
+            set -e
+            h_win=$(sha256sum < $name.win.stdout | cut -d' ' -f1)
+            h_gold=$(sha256sum < test/golden/$name.stdout | cut -d' ' -f1)
+            same=MISMATCH; [ "$h_win" = "$h_gold" ] && same=MATCH
+            echo "::notice title=windows-reference-$name::host=$ver $(uname -m) | exit=$code (want $want) | stdout=$same | bytes=$(wc -c < $name.win.stdout | tr -d ' ') | sha256=$h_win golden=$h_gold | stderr_bytes=$(wc -c < $name.win.stderr | tr -d ' ')"
+            if [ "$same" != MATCH ]; then diff $name.win.stdout test/golden/$name.stdout || true; status=1; fi
+            [ "$code" -eq "$want" ] || status=1
+          done
+          exit $status

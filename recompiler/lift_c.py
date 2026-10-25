@@ -35,7 +35,10 @@ COND_NAMES = ["X86_CC_O", "X86_CC_NO", "X86_CC_B", "X86_CC_AE", "X86_CC_E", "X86
               "X86_CC_BE", "X86_CC_A", "X86_CC_S", "X86_CC_NS", "X86_CC_P", "X86_CC_NP",
               "X86_CC_L", "X86_CC_GE", "X86_CC_LE", "X86_CC_G"]
 
-BINOPS = {"add": "x86_add", "sub": "x86_sub", "and": "x86_and", "or": "x86_or", "xor": "x86_xor"}
+BINOPS = {"add": "x86_add", "sub": "x86_sub", "and": "x86_and", "or": "x86_or", "xor": "x86_xor",
+          "adc": "x86_adc", "sbb": "x86_sbb"}
+SHIFTS = {"shr": "x86_shr", "shl": "x86_shl", "sal": "x86_shl", "sar": "x86_sar"}
+STRING_OPS = {"rep stosb": "x86_rep_stosb", "rep movsb": "x86_rep_movsb"}
 CMPOPS = {"cmp": "x86_sub", "test": "x86_and"}
 UNOPS = {"inc": "x86_inc", "dec": "x86_dec", "neg": "x86_neg"}
 
@@ -59,14 +62,25 @@ class _Fn:
     # ---- operands ----------------------------------------------------------
     def check_prefixes(self):
         p = self.insn.prefixes
-        if any(x in (0xF0, 0xF2, 0xF3) for x in p):
-            raise _err(self.insn, "LOCK/REP prefixes are not supported")
+        mn = self.insn.mnemonic
         if 0x67 in p:
             raise _err(self.insn, "32-bit address-size override is not supported")
+        if mn in STRING_OPS:
+            if any(x in (0xF0, 0xF2) for x in p):
+                raise _err(self.insn, "LOCK/REPNE on a string instruction is not supported")
+            for op in self.insn.operands:      # implicit [rdi]/[rsi] (ES/DS are flat in 64-bit mode)
+                if op.kind == "mem" and (op.mem.base is None or op.mem.base.name not in ("rdi", "rsi")
+                                         or op.mem.index is not None or op.mem.disp):
+                    raise _err(self.insn, "unexpected string-instruction operand")
+                if op.kind == "mem" and op.mem.segment is not None and op.mem.segment.name in ("fs", "gs"):
+                    raise _err(self.insn, f"segment override {op.mem.segment.name} is not supported")
+            return
+        if any(x in (0xF0, 0xF2, 0xF3) for x in p):
+            raise _err(self.insn, "LOCK/REP prefixes are not supported")
         for op in self.insn.operands:
             if op.kind == "mem" and op.mem.segment is not None:
                 raise _err(self.insn, f"segment override {op.mem.segment.name} is not supported")
-            if op.kind == "reg" and op.reg.kind != "gpr":
+            if op.kind == "reg" and op.reg.kind != "gpr" and not (op.reg.kind == "xmm" and mn == "movaps"):
                 raise _err(self.insn, f"register {op.reg.name} is not supported")
 
     def ea(self, op: Operand) -> str:
@@ -220,14 +234,60 @@ class Lifter:
             e = with_ea(dst)
             f.emit(f"t = {UNOPS[mn]}(s, {f.read(dst, e)}, {dst.bits});")
             f.emit(f.write(dst, "t", e))
-        elif mn == "shr":
+        elif mn in SHIFTS:
             dst, cnt = f.need(2)
             if not (cnt.kind == "imm" or (cnt.kind == "reg" and cnt.reg.name == "cl")):
                 raise _err(insn, "shift count must be imm8 or CL")
             f.emit(f"s->rip = {self.va_expr(insn.address)};")
             e = with_ea(dst)
-            f.emit(f"t = x86_shr(s, {f.read(dst, e)}, {f.read(cnt)}, {dst.bits});")
+            f.emit(f"t = {SHIFTS[mn]}(s, {f.read(dst, e)}, {f.read(cnt)}, {dst.bits});")
             f.emit(f.write(dst, "t", e))
+        elif mn in ("movzx", "movsx"):
+            dst, src = f.need(2)
+            if dst.kind != "reg" or dst.size not in (2, 4, 8) or src.size not in (1, 2) or src.size >= dst.size:
+                raise _err(insn, f"invalid {mn} form")
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            v = f.read(src) if mn == "movzx" else f"x86_sext({f.read(src)}, {src.bits})"
+            f.emit(f.write(dst, v))
+        elif mn == "not":
+            (dst,) = f.need(1)
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            e = with_ea(dst)
+            f.emit(f"t = x86_not({f.read(dst, e)}, {dst.bits});")
+            f.emit(f.write(dst, "t", e))
+        elif mn.startswith("set") and mn[3:] in COND:
+            (dst,) = f.need(1)
+            if dst.size != 1:
+                raise _err(insn, "setcc destination must be 8-bit")
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            f.emit(f.write(dst, f"(uint64_t)x86_cond(s, {COND_NAMES[COND[mn[3:]]]})"))
+        elif mn == "xchg":
+            a, b = f.need(2)
+            if a.size != b.size or a.kind == "imm" or b.kind == "imm" or (a.kind == "mem" and b.kind == "mem"):
+                raise _err(insn, "invalid xchg form")
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            ea_a = with_ea(a)
+            ea_b = with_ea(b)
+            f.emit(f"t = {f.read(a, ea_a)};")
+            f.emit(f"{{ uint64_t u = {f.read(b, ea_b)};")
+            f.emit("  " + f.write(a, "u", ea_a))
+            f.emit("  " + f.write(b, "t", ea_b) + " }")
+        elif mn in STRING_OPS:
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            f.emit(f"{STRING_OPS[mn]}(s);")
+        elif mn == "movaps":
+            dst, src = f.need(2)
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            if dst.kind == "reg" and src.kind == "mem":
+                f.emit(f"x86_ld128(s, {dst.reg.index}, {f.ea(src)}, 1);")
+            elif dst.kind == "mem" and src.kind == "reg":
+                f.emit(f"x86_st128(s, {src.reg.index}, {f.ea(dst)}, 1);")
+            elif dst.kind == "reg" and src.kind == "reg":
+                f.emit(f"s->xmm[{dst.reg.index}] = s->xmm[{src.reg.index}];")
+            else:
+                raise _err(insn, "invalid movaps form")
+            if any(o.kind == "reg" and o.reg.kind != "xmm" for o in (dst, src)):
+                raise _err(insn, "movaps operand must be an XMM register")
         elif mn == "mul":
             (src,) = f.need(1)
             if src.size not in (4, 8):
@@ -251,12 +311,12 @@ class Lifter:
                 f.emit(f.write(dst, "t"))
             else:
                 raise _err(insn, "one-operand imul is not supported")
-        elif mn == "idiv":
+        elif mn in ("idiv", "div"):
             (src,) = f.need(1)
             if src.size not in (4, 8):
-                raise _err(insn, "idiv width")
+                raise _err(insn, f"{mn} width")
             f.emit(f"s->rip = {self.va_expr(insn.address)};")
-            f.emit(f"x86_idiv(s, {f.read(src)}, {src.bits});")
+            f.emit(f"x86_{mn}(s, {f.read(src)}, {src.bits});")
         elif mn == "cdq":
             f.need(0)
             f.emit("x86_cdq(s);")

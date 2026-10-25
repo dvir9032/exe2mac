@@ -29,10 +29,13 @@ class RegisterModelTests(unittest.TestCase):
         self.assertEqual(dec.make_register("r9d").full, "r9")
         self.assertEqual(dec.make_register("ch").full, "rcx")
 
-    def test_non_gpr_registers_are_marked_other(self):
-        self.assertEqual(dec.make_register("xmm0").kind, "other")
+    def test_non_gpr_registers(self):
+        x = dec.make_register("xmm13")
+        self.assertEqual((x.kind, x.index, x.width), ("xmm", 13, 128))
+        self.assertIsNone(x.full)
         self.assertEqual(dec.make_register("rip").kind, "rip")
-        self.assertIsNone(dec.make_register("xmm0").full)
+        self.assertEqual(dec.make_register("ymm0").kind, "other")
+        self.assertEqual(dec.make_register("st(0)").kind, "other")
 
 
 @unittest.skipUnless(HAVE_CS, "capstone is required")

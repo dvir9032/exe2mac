@@ -79,6 +79,8 @@ HW_BIN(sub, "sub")
 HW_BIN(and, "and")
 HW_BIN(or, "or")
 HW_BIN(xor, "xor")
+HW_BIN(adc, "adc")
+HW_BIN(sbb, "sbb")
 
 #define HW_UN(NAME, INSN)                                                               \
 static uint64_t hw_##NAME(unsigned bits, uint64_t a, uint64_t fin, uint64_t *fout) {   \
@@ -98,6 +100,7 @@ static uint64_t hw_##NAME(unsigned bits, uint64_t a, uint64_t fin, uint64_t *fou
 HW_UN(inc, "inc")
 HW_UN(dec, "dec")
 HW_UN(neg, "neg")
+HW_UN(not, "not")
 
 static uint64_t hw_shr(unsigned bits, uint64_t a, uint8_t c, uint64_t fin, uint64_t *fout) {
     uint64_t x = a, f;
@@ -108,6 +111,27 @@ static uint64_t hw_shr(unsigned bits, uint64_t a, uint8_t c, uint64_t fin, uint6
     default: __asm__ volatile("pushq %3; popfq; shrq %%cl, %0; pushfq; popq %1"  : "+r"(x), "=r"(f) : "c"(c), "r"(fin) : "cc"); break;
     }
     *fout = f; return x & x86_mask(bits);
+}
+
+#define HW_SHIFT(NAME, INSN)                                                               \
+static uint64_t hw_##NAME(unsigned bits, uint64_t a, uint8_t c, uint64_t fin, uint64_t *fout) { \
+    uint64_t x = a, f;                                                                     \
+    switch (bits) {                                                                        \
+    case 8:  __asm__ volatile("pushq %3; popfq; " INSN "b %%cl, %b0; pushfq; popq %1" : "+q"(x), "=r"(f) : "c"(c), "r"(fin) : "cc"); break; \
+    case 16: __asm__ volatile("pushq %3; popfq; " INSN "w %%cl, %w0; pushfq; popq %1" : "+r"(x), "=r"(f) : "c"(c), "r"(fin) : "cc"); break; \
+    case 32: __asm__ volatile("pushq %3; popfq; " INSN "l %%cl, %k0; pushfq; popq %1" : "+r"(x), "=r"(f) : "c"(c), "r"(fin) : "cc"); break; \
+    default: __asm__ volatile("pushq %3; popfq; " INSN "q %%cl, %0; pushfq; popq %1"  : "+r"(x), "=r"(f) : "c"(c), "r"(fin) : "cc"); break; \
+    }                                                                                      \
+    *fout = f; return x & x86_mask(bits);                                                  \
+}
+HW_SHIFT(shl, "shl")
+HW_SHIFT(sar, "sar")
+
+static void hw_div(unsigned bits, uint64_t rax, uint64_t rdx, uint64_t src, uint64_t *orax, uint64_t *ordx) {
+    uint64_t a = rax, d = rdx;
+    if (bits == 64) __asm__ volatile("divq %2" : "+a"(a), "+d"(d) : "r"(src) : "cc");
+    else            __asm__ volatile("divl %k2" : "+a"(a), "+d"(d) : "r"(src) : "cc");
+    *orax = a; *ordx = d;
 }
 
 static uint64_t hw_imul2(unsigned bits, uint64_t a, uint64_t b, uint64_t fin, uint64_t *fout) {
@@ -172,6 +196,8 @@ static void check_pair(uint64_t a, uint64_t b, uint64_t fin) {
         BIN(and, F_CF | F_PF | F_ZF | F_SF | F_OF)
         BIN(or,  F_CF | F_PF | F_ZF | F_SF | F_OF)
         BIN(xor, F_CF | F_PF | F_ZF | F_SF | F_OF)
+        BIN(adc, F_ALL)
+        BIN(sbb, F_ALL)
 #undef BIN
 #define UN(NAME) load_flags(&s, fin); hr = hw_##NAME(bits, A, fin, &hf); \
         mr = x86_##NAME(&s, A, bits); cmp_result(#NAME, bits, A, 0, fin, hr, hf, mr, &s, F_ALL);
@@ -179,6 +205,9 @@ static void check_pair(uint64_t a, uint64_t b, uint64_t fin) {
         UN(dec)
         UN(neg)
 #undef UN
+        /* NOT: result only; flags must be untouched (all 6 compared) */
+        load_flags(&s, fin); hr = hw_not(bits, A, fin, &hf); mr = x86_not(A, bits);
+        cmp_result("not", bits, A, 0, fin, hr, hf, mr, &s, F_ALL);
         /* SHR with every count 0..70 (exercises masking) */
         for (unsigned c = 0; c <= 70; c += (c < 10 ? 1 : 7)) {
             unsigned eff = c & (bits == 64 ? 0x3f : 0x1f);
@@ -192,6 +221,16 @@ static void check_pair(uint64_t a, uint64_t b, uint64_t fin) {
             hr = hw_shr(bits, A, (uint8_t)c, fin, &hf);
             mr = x86_shr(&s, A, c, bits);
             cmp_result("shr", bits, A, c, fin, hr, hf, mr, &s, mask);
+            /* SHL: same defined-flag rules as SHR (OF only for count 1) */
+            load_flags(&s, fin);
+            hr = hw_shl(bits, A, (uint8_t)c, fin, &hf);
+            mr = x86_shl(&s, A, c, bits);
+            cmp_result("shl", bits, A, c, fin, hr, hf, mr, &s, mask);
+            /* SAR */
+            load_flags(&s, fin);
+            hr = hw_sar(bits, A, (uint8_t)c, fin, &hf);
+            mr = x86_sar(&s, A, c, bits);
+            cmp_result("sar", bits, A, c, fin, hr, hf, mr, &s, mask);
         }
         if (bits >= 16) {
             load_flags(&s, fin);
@@ -235,6 +274,23 @@ static void check_pair(uint64_t a, uint64_t b, uint64_t fin) {
                 cases++;
                 if (orax != s.gpr[X86_RAX] || ordx != s.gpr[X86_RDX])
                     report("idiv", bits, a, b, rdx_in, orax, s.gpr[X86_RAX], ordx, s.gpr[X86_RDX], 0);
+            }
+            /* DIV (unsigned): only inputs that do not raise #DE */
+            {
+                uint64_t rdx_u = next_rand();
+                if (next_rand() & 1) rdx_u = 0;
+                uint64_t div_b = b, ok_u;
+                if (bits == 32) { rdx_u &= 0xffffffffu; div_b &= 0xffffffffu;
+                    ok_u = div_b != 0 && (((rdx_u << 32) | (a & 0xffffffffu)) / div_b) <= 0xffffffffu; }
+                else ok_u = div_b != 0 && rdx_u < div_b;
+                if (ok_u) {
+                    hw_div(bits, a, rdx_u, b, &orax, &ordx);
+                    s.gpr[X86_RAX] = a; s.gpr[X86_RDX] = rdx_u;
+                    x86_div(&s, b, bits);
+                    cases++;
+                    if (orax != s.gpr[X86_RAX] || ordx != s.gpr[X86_RDX])
+                        report("div", bits, a, b, rdx_u, orax, s.gpr[X86_RAX], ordx, s.gpr[X86_RDX], 0);
+                }
             }
             /* CDQ / CQO */
             uint64_t ca = a, cd = 0x1234567812345678ull;

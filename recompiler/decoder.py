@@ -65,7 +65,7 @@ class Register:
     """A register reference.
 
     ``kind`` is ``"gpr"`` (general purpose, ``index`` 0..15 in hardware
-    encoding order), ``"rip"`` or ``"other"``. ``width`` is in bits.
+    encoding order), ``"xmm"`` (``index`` 0..15), ``"rip"`` or ``"other"``. ``width`` is in bits.
     ``high8`` marks AH/CH/DH/BH (bits 8..15 of the 64-bit register).
     """
     name: str
@@ -90,6 +90,8 @@ def make_register(name: str) -> Register:
         return Register(name, "gpr", idx, width, high)
     if name == "rip":
         return Register(name, "rip", None, 64)
+    if name.startswith("xmm") and name[3:].isdigit() and int(name[3:]) < 16:
+        return Register(name, "xmm", int(name[3:]), 128)
     return Register(name, "other", None, 0)
 
 

@@ -32,6 +32,7 @@ typedef struct x86_state {
     uint64_t gpr[16];
     uint64_t rip;            /* guest VA of the current / last return target */
     uint8_t cf, pf, af, zf, sf, of, df;
+    struct { uint64_t lo, hi; } xmm[16];   /* SSE registers (only moves are implemented) */
     guest_mem *mem;
 } x86_state;
 
@@ -161,6 +162,69 @@ static inline uint64_t x86_shr(x86_state *s, uint64_t a, uint64_t count, unsigne
     return r;
 }
 
+/* ADC/SBB: like ADD/SUB with the incoming CF as an extra carry/borrow. */
+static inline uint64_t x86_adc(x86_state *s, uint64_t a, uint64_t b, unsigned bits) {
+    uint64_t m = x86_mask(bits), c = s->cf;
+    a &= m; b &= m;
+    uint64_t t = (a + b) & m;
+    uint64_t r = (t + c) & m;
+    s->cf = (uint8_t)((t < a) | (r < t));
+    s->of = (uint8_t)x86_msb(~(a ^ b) & (a ^ r), bits);
+    s->af = (uint8_t)(((a ^ b ^ r) >> 4) & 1);
+    x86_set_szp(s, r, bits);
+    return r;
+}
+static inline uint64_t x86_sbb(x86_state *s, uint64_t a, uint64_t b, unsigned bits) {
+    uint64_t m = x86_mask(bits), c = s->cf;
+    a &= m; b &= m;
+    uint64_t t = (a - b) & m;
+    uint64_t r = (t - c) & m;
+    s->cf = (uint8_t)((a < b) | (t < c));
+    s->of = (uint8_t)x86_msb((a ^ b) & (a ^ r), bits);
+    s->af = (uint8_t)(((a ^ b ^ r) >> 4) & 1);
+    x86_set_szp(s, r, bits);
+    return r;
+}
+
+/* NOT: no flags. */
+static inline uint64_t x86_not(uint64_t a, unsigned bits) { return ~a & x86_mask(bits); }
+
+/* SHL/SAL r/m, count. Count masked like SHR; count 0 leaves flags.
+ * CF = last bit shifted out (undefined when count > width: 8/16-bit only).
+ * OF = MSB(result) XOR CF when count == 1, else undefined. AF undefined. */
+static inline uint64_t x86_shl(x86_state *s, uint64_t a, uint64_t count, unsigned bits) {
+    unsigned c = (unsigned)(count & (bits == 64 ? 0x3f : 0x1f));
+    a &= x86_mask(bits);
+    if (c == 0) return a;
+    uint64_t r = c >= bits ? 0 : ((a << c) & x86_mask(bits));
+    if (c <= bits) s->cf = (uint8_t)((a >> (bits - c)) & 1);
+    if (c == 1) s->of = (uint8_t)(x86_msb(r, bits) ^ s->cf);
+    x86_set_szp(s, r, bits);
+    return r;
+}
+
+/* SAR r/m, count: arithmetic right shift. CF = last bit shifted out
+ * (undefined when count > width), OF = 0 when count == 1. AF undefined.
+ * Implemented on unsigned values: no implementation-defined signed shifts. */
+static inline uint64_t x86_sar(x86_state *s, uint64_t a, uint64_t count, unsigned bits) {
+    unsigned c = (unsigned)(count & (bits == 64 ? 0x3f : 0x1f));
+    a &= x86_mask(bits);
+    if (c == 0) return a;
+    uint64_t sx = x86_sext(a, bits);                  /* 64-bit sign-extended view */
+    uint64_t neg = sx >> 63;
+    unsigned cc = c > 63 ? 63 : c;
+    uint64_t r = neg ? ~((~sx) >> cc) : (sx >> cc);
+    r &= x86_mask(bits);
+    if (c <= bits) s->cf = (uint8_t)((sx >> (c - 1)) & 1);
+    if (c == 1) s->of = 0;
+    x86_set_szp(s, r, bits);
+    return r;
+}
+
+/* DIV r/m (unsigned). 32: EDX:EAX / src; 64: RDX:RAX / src. #DE on zero
+ * divisor or quotient overflow. All flags undefined (unchanged). */
+static inline void x86_div(x86_state *s, uint64_t src, unsigned bits);
+
 /* MUL r/m (unsigned): RDX:RAX = RAX * src (64) or EDX:EAX = EAX * src (32).
  * CF=OF = (high half != 0). SF/ZF/AF/PF undefined (unchanged). */
 static inline void x86_mul(x86_state *s, uint64_t src, unsigned bits) {
@@ -243,6 +307,68 @@ static inline void x86_idiv(x86_state *s, uint64_t src, unsigned bits) {
     } else {
         exe2mac_fault(s, "idiv: unsupported operand width", bits);
     }
+}
+
+static inline void x86_div(x86_state *s, uint64_t src, unsigned bits) {
+    if (bits == 32) {
+        uint64_t dividend = ((s->gpr[X86_RDX] & 0xffffffffu) << 32) | (s->gpr[X86_RAX] & 0xffffffffu);
+        uint64_t divisor = src & 0xffffffffu;
+        if (divisor == 0) exe2mac_raise(s, EXE2MAC_STATUS_INTEGER_DIVIDE_BY_ZERO, "div32: divide by zero");
+        uint64_t q = dividend / divisor, r = dividend % divisor;
+        if (q > 0xffffffffu) exe2mac_raise(s, EXE2MAC_STATUS_INTEGER_OVERFLOW, "div32: quotient overflow");
+        x86_set(s, X86_RAX, 32, 0, q);
+        x86_set(s, X86_RDX, 32, 0, r);
+    } else if (bits == 64) {
+        unsigned __int128 dividend = ((unsigned __int128)s->gpr[X86_RDX] << 64) | s->gpr[X86_RAX];
+        if (src == 0) exe2mac_raise(s, EXE2MAC_STATUS_INTEGER_DIVIDE_BY_ZERO, "div64: divide by zero");
+        if (s->gpr[X86_RDX] >= src) exe2mac_raise(s, EXE2MAC_STATUS_INTEGER_OVERFLOW, "div64: quotient overflow");
+        s->gpr[X86_RAX] = (uint64_t)(dividend / src);
+        s->gpr[X86_RDX] = (uint64_t)(dividend % src);
+    } else {
+        exe2mac_fault(s, "div: unsupported operand width", bits);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* string operations (byte granularity, 64-bit addressing)              */
+/* ------------------------------------------------------------------ */
+/* REP STOSB: while RCX != 0 { [RDI] = AL; RDI += DF ? -1 : 1; RCX-- }. No flags. */
+static inline void x86_rep_stosb(x86_state *s) {
+    uint64_t step = s->df ? ~(uint64_t)0 : 1;
+    uint8_t al = (uint8_t)s->gpr[X86_RAX];
+    while (s->gpr[X86_RCX] != 0) {
+        guest_st8(s->mem, s->gpr[X86_RDI], al);
+        s->gpr[X86_RDI] += step;
+        s->gpr[X86_RCX] -= 1;
+    }
+}
+/* REP MOVSB: byte-by-byte, so overlapping ranges behave exactly like hardware. */
+static inline void x86_rep_movsb(x86_state *s) {
+    uint64_t step = s->df ? ~(uint64_t)0 : 1;
+    while (s->gpr[X86_RCX] != 0) {
+        guest_st8(s->mem, s->gpr[X86_RDI], guest_ld8(s->mem, s->gpr[X86_RSI]));
+        s->gpr[X86_RSI] += step;
+        s->gpr[X86_RDI] += step;
+        s->gpr[X86_RCX] -= 1;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* SSE moves                                                            */
+/* ------------------------------------------------------------------ */
+#define EXE2MAC_STATUS_ACCESS_VIOLATION_CODE 0xC0000005u
+/* MOVAPS m128 requires 16-byte alignment (#GP otherwise; Windows reports an access violation). */
+static inline void x86_ld128(x86_state *s, int x, uint64_t va, int aligned) {
+    if (aligned && (va & 15)) exe2mac_raise(s, EXE2MAC_STATUS_ACCESS_VIOLATION_CODE, "movaps: misaligned operand");
+    (void)guest_ptr(s->mem, va, 16, GUEST_PERM_R);
+    s->xmm[x].lo = guest_ld64(s->mem, va);
+    s->xmm[x].hi = guest_ld64(s->mem, va + 8);
+}
+static inline void x86_st128(x86_state *s, int x, uint64_t va, int aligned) {
+    if (aligned && (va & 15)) exe2mac_raise(s, EXE2MAC_STATUS_ACCESS_VIOLATION_CODE, "movaps: misaligned operand");
+    (void)guest_ptr(s->mem, va, 16, GUEST_PERM_W);     /* fault before any partial write */
+    guest_st64(s->mem, va, s->xmm[x].lo);
+    guest_st64(s->mem, va + 8, s->xmm[x].hi);
 }
 
 /* CDQ: EDX = sign of EAX (32-bit write, zero-extends RDX). CQO: RDX = sign of RAX. */
