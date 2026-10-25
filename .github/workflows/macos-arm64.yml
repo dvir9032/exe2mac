@@ -145,14 +145,16 @@ jobs:
           done
           # xm.exe: one unmasked SSE exception per case -> full NTSTATUS per case
           cmd.exe //c "test\\xm.windows.bat"
-          n=0
+          # one annotation for all cases (GitHub keeps at most 10 notices per step)
+          n=0; line=""
           while read -r c v; do
             [ -n "$c" ] || continue
             n=$((n + 1))
             got=$(printf '0x%08x' $(( v & 0xffffffff )))
             want=$(awk -v c="$c" '$1 == c { print $2 }' test/golden/xm.codes)
-            res=MATCH; [ "$got" = "$want" ] || { res=MISMATCH; status=1; }
-            echo "::notice title=windows-reference-xm-$c::status=$got want=$want $res"
+            res=ok; [ "$got" = "$want" ] || { res=MISMATCH; status=1; }
+            line="$line case$c=$got(want $want $res)"
           done < <(tr -d '\r' < xm.win.codes)
+          echo "::notice title=windows-reference-xm::$line"
           [ "$n" -eq "$(grep -c . test/golden/xm.codes)" ] || { echo "::error::xm: $n cases ran"; status=1; }
           exit $status
