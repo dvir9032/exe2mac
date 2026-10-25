@@ -111,6 +111,8 @@ SSE_MNEMONICS |= (set(SSE_CMP_SS) | set(SSE_PACKED_CVT) | SSE_NT_STORES
 # no architectural effect for one guest thread (cache hints and memory-ordering fences)
 NO_EFFECT = {"prefetchnta", "prefetcht0", "prefetcht1", "prefetcht2", "prefetchw", "sfence", "lfence", "mfence",
              "pause"}
+# SSE forms whose operands can be a GPR and a memory location (no XMM register)
+SSE_GPR_FROM_MEM = {"cvttss2si", "cvtss2si", "cvttsd2si", "cvtsd2si"}
 CMPOPS = {"cmp": "x86_sub", "test": "x86_and"}
 UNOPS = {"inc": "x86_inc", "dec": "x86_dec", "neg": "x86_neg"}
 
@@ -147,6 +149,8 @@ class _Fn:
                 if op.kind == "mem" and op.mem.segment is not None and op.mem.segment.name in ("fs", "gs"):
                     raise _err(self.insn, f"segment override {op.mem.segment.name} is not supported")
             return
+        if 0xF2 in p and getattr(self, "bnd", False):
+            p = [x for x in p if x != 0xF2]
         if 0xF0 in p and getattr(self, "locked", False):
             p = [x for x in p if x != 0xF0]            # validated by the lifter: RMW on memory
         if any(x in (0xF0, 0xF2, 0xF3) for x in p):
@@ -276,6 +280,10 @@ class Lifter:
     def lift_insn(self, insn: Instruction, fn_entry: int, block_succ: list[int]) -> list[str]:
         f = _Fn(self, insn)
         mn = insn.mnemonic
+        if mn.startswith("bnd ") and insn.flow in ("jump", "cond_branch", "call", "ret"):
+            # MPX BND prefix (F2) on a branch: no effect when MPX is not enabled (CPUID reports no MPX)
+            mn = mn[4:]
+            f.bnd = True
         if mn.startswith("lock "):
             mn = mn[5:]
             if mn not in LOCKABLE or not insn.operands or insn.operands[0].kind != "mem":
@@ -437,7 +445,8 @@ class Lifter:
             # a 32-bit destination is zero-extended whether or not the move happens
             f.emit(f"t = {f.read(src)};")
             f.emit(f.write(dst, f"x86_cond(s, {COND_NAMES[COND[mn[4:]]]}) ? t : {f.read(dst)}"))
-        elif mn in SSE_MNEMONICS and any(o.kind == "reg" and o.reg.kind == "xmm" for o in ops):
+        elif mn in SSE_MNEMONICS and (any(o.kind == "reg" and o.reg.kind == "xmm" for o in ops)
+                                      or mn in SSE_GPR_FROM_MEM):
             f.emit(f"s->rip = {self.va_expr(insn.address)};")
             self.lift_sse(f, insn)
         elif mn in ("ldmxcsr", "stmxcsr"):
@@ -592,7 +601,8 @@ class Lifter:
         def src64(op):            # scalar double source: xmm low qword or m64
             if op.kind == "reg":
                 return f"s->xmm[{xmm(op)}].lo"
-            if op.kind == "mem" and op.size == 8:
+            # (Capstone sizes the comisd/ucomisd memory operand as xmmword; the instruction reads m64)
+            if op.kind == "mem" and (op.size == 8 or (op.size == 16 and mn in ("comisd", "ucomisd"))):
                 return f"guest_ld64(s->mem, {f.ea(op)})"
             raise _err(insn, "expected xmm or m64 source")
 

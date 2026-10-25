@@ -462,3 +462,10 @@ class Wave3SnippetTests(_SnippetCheck, unittest.TestCase):
         self.check("b803000000660f6ec00f5bc8f30f2cc90f2fc90f180424660f7ecac3",
                    {"rax": 3, "rcx": 3, "rdx": 0x40400000},
                    {"cf": 0, "pf": 0, "af": 0, "zf": 1, "sf": 0, "of": 0})
+
+    def test_gpr_from_memory_conversion_bnd_prefix_and_comisd_m64(self):
+        # cvttss2si eax, [rsp] (pi -> 3); comisd xmm0, [rsp+8] (1.0 == 1.0); bnd jne (not taken); bnd ret
+        self.check("4883ec18c70424db0f4940f30f2c042448b9000000000000f03f48894c240866480f6ec1660f2f442408"
+                   "488d642418f27505ba07000000f2c3",
+                   {"rax": 3, "rcx": 0x3ff0000000000000, "rdx": 7},
+                   {"cf": 0, "pf": 0, "af": 0, "zf": 1, "sf": 0, "of": 0})
