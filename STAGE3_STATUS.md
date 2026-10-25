@@ -62,5 +62,14 @@ conversions, NaN/inf/denormal/signed-zero cases; every result printed as bits).
   portable SSE unit tests (x86 NaN rules and integer-indefinite conversions on an ARM64 host)
 - Linux x86-64: 104 tests OK (1 macOS-only skip); SSE differential 8,119,800 cases, 0 failures
 
+## kernel32 wave — run 40186299983 (2026-10-25)
+New imports: ReadFile (stdin), GetCommandLineA, GetLastError/SetLastError,
+GetProcessHeap, HeapAlloc/HeapReAlloc/HeapFree, VirtualAlloc/VirtualFree.
+New instructions found by the fixture: bt (register/immediate offset), cdqe/cwde.
+Fixture `test/io.exe` (arguments + stdin, built without auto-vectorisation):
+- Windows reference via `test/io.windows.bat`: exit 5, stdout sha256 `4eda3363…` = golden (273 bytes)
+- macOS ARM64: 107 tests OK (2 x86-only differential skips), incl. io end-to-end
+- Linux x86-64: 107 tests OK (1 macOS-only skip); heap/quoting 26,977 checks; bridges 113 checks
+
 ## Not implemented
 See "Limitations" in `docs/TRANSLATION.md`. 

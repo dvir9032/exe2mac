@@ -82,6 +82,13 @@ executables (no Wine, no CPU emulation at run time). First fixture:
     so portable SDM-derived tests were added (they run on the macOS runner).
     `fp.exe` (exit 27, 1681 bytes) matches its model and the Windows run.
 
+13. **kernel32 wave.** Process heap (first-fit, host-side metadata), command
+    line from argv with Windows quoting, last-error value, VirtualAlloc regions,
+    ReadFile from stdin; `bt`, `cdqe`/`cwde`. Fixture `test/io.exe` with arguments
+    and stdin matches its model and the Windows run (exit 5, 273 bytes). clang
+    auto-vectorised one loop (packed SSE, unsupported → translation stopped as
+    intended), so this fixture is built with `-fno-vectorize -fno-slp-vectorize`.
+
 ## Open items / caveats
 - Golden output now confirmed on Windows (see `test/golden/README.md`).
 - Undefined x86 flags are left unchanged (a legal outcome).
@@ -97,5 +104,5 @@ limitations), `docs/DECODER_CFG.md`, `runtime/README.md`,
 Remill Apache-2.0 used only as architectural references, no code copied).
 
 ## Next step
-Options: more kernel32 imports (command line, memory, file input),
-tail calls between functions, packed SSE, MXCSR modelling.
+Packed SSE2 integer/FP instructions so auto-vectorised code translates;
+then tail calls between functions, MXCSR modelling.
