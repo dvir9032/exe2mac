@@ -113,5 +113,6 @@ show("  snan+1  ", (0x7FF8000000000001, IE))
 show("  1/0     ", (0x7FF0000000000000, ZE))
 out.append("unmasking ZE and dividing by zero")
 sys.stdout.buffer.write(("\n".join(out) + "\n").encode())
-# Unmasked ZE -> #XM -> STATUS_FLOAT_MULTIPLE_FAULTS (0xC00002B4); POSIX keeps 0xB4.
-sys.stderr.write("exit=180\n")
+# Unmasked ZE -> #XM -> STATUS_FLOAT_DIVIDE_BY_ZERO (0xC000008E, observed on
+# Windows); POSIX keeps the low byte 0x8E.
+sys.stderr.write("exit=142\n")

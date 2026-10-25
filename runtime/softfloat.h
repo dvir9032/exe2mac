@@ -39,9 +39,15 @@ static const sf_fmt SF_F64 = { 53, 11, 1023, -1022, 1023 };
 static const sf_fmt SF_F32 = { 24, 8, 127, -126, 127 };
 
 /* MXCSR environment for one operation */
-typedef struct sf_env { unsigned rc, ftz, daz; } sf_env;
+/* ue_unmasked / oe_unmasked: MXCSR.UM / MXCSR.OM clear. The operation then
+ * faults (the caller raises #XM, the destination is not written) and x86
+ * reports PE only if the result rounded to p bits with an unbounded exponent
+ * is inexact. Unmasked underflow is reported on tininess alone, exact or not,
+ * and FTZ does not apply (SDM Vol.1 11.5.2.4/11.5.2.5; tests/c/diff_xm.c). */
+typedef struct sf_env { unsigned rc, ftz, daz, ue_unmasked, oe_unmasked; } sf_env;
 static inline sf_env sf_env_of(uint32_t mxcsr) {
-    sf_env e = { (mxcsr >> 13) & 3u, (mxcsr >> 15) & 1u, (mxcsr >> 6) & 1u };
+    sf_env e = { (mxcsr >> 13) & 3u, (mxcsr >> 15) & 1u, (mxcsr >> 6) & 1u,
+                 !((mxcsr >> 11) & 1u), !((mxcsr >> 10) & 1u) };
     return e;
 }
 
@@ -156,6 +162,11 @@ static inline uint64_t sf_round_pack(const sf_fmt *f, const sf_env *env, unsigne
         if (sf_bitlen(q2 + (sf_u128)up2) > p) tiny = 0;
     }
 
+    if (tiny && env->ue_unmasked) {                        /* unmasked: tininess alone; no FTZ */
+        int inexact_p = sticky || (n > p && (m & (((sf_u128)1 << (n - p)) - 1)) != 0);
+        *flags |= SF_UE | (inexact_p ? SF_PE : 0u);        /* the caller faults; dest is not written */
+        return sf_zero(f, sign);
+    }
     if (tiny && env->ftz) {                                /* x86: FTZ (underflow masked) */
         *flags |= SF_UE | SF_PE;
         return sf_zero(f, sign);
@@ -166,7 +177,7 @@ static inline uint64_t sf_round_pack(const sf_fmt *f, const sf_env *env, unsigne
     if (q == 0) return sf_zero(f, sign);
     int Eres = qlsb + (int)sf_bitlen(q) - 1;
     if (Eres > f->emax) {
-        *flags |= SF_OE | SF_PE;
+        *flags |= SF_OE | (env->oe_unmasked ? 0u : SF_PE); /* unmasked: PE iff the p-bit rounding was inexact */
         switch (env->rc) {
         case SF_RN: return sf_inf(f, sign);
         case SF_RZ: return sf_max(f, sign);

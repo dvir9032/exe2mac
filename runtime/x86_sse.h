@@ -40,19 +40,39 @@ static inline int f32_isnan(uint32_t b) { return (b & 0x7F800000u) == 0x7F800000
 enum { SSE_ADD, SSE_SUB, SSE_MUL, SSE_DIV };
 
 #define EXE2MAC_MXCSR_DEFAULT                0x1F80u
-#define EXE2MAC_STATUS_FLOAT_MULTIPLE_FAULTS 0xC00002B4u   /* #XM from IE / DE / ZE */
-#define EXE2MAC_STATUS_FLOAT_MULTIPLE_TRAPS  0xC00002B5u   /* #XM from OE / UE / PE */
+/* NTSTATUS for an unhandled SSE floating-point exception (#XM). Windows
+ * reports the specific cause; with several unmasked causes the first in the
+ * order IE, DE, ZE, OE, UE, PE is used (verified on Windows, see test/xm.c). */
+#define EXE2MAC_STATUS_FLOAT_INVALID_OPERATION 0xC0000090u
+#define EXE2MAC_STATUS_FLOAT_DENORMAL_OPERAND  0xC000008Du
+#define EXE2MAC_STATUS_FLOAT_DIVIDE_BY_ZERO    0xC000008Eu
+#define EXE2MAC_STATUS_FLOAT_OVERFLOW          0xC0000091u
+#define EXE2MAC_STATUS_FLOAT_UNDERFLOW         0xC0000093u
+#define EXE2MAC_STATUS_FLOAT_INEXACT_RESULT    0xC000008Fu
 
 static inline sf_env sse_env(const x86_state *s) { return sf_env_of(s->mxcsr); }
 
-/* Record exception flags; raise #XM for any unmasked one. */
+/* Record exception flags; raise #XM for any unmasked one.
+ * `fl` holds every flag the operation (all lanes) would raise if nothing
+ * faulted. When an exception is unmasked, x86 stops early (SDM Vol.1 11.5.1,
+ * checked against hardware by tests/c/diff_xm.c):
+ *   an unmasked pre-computation exception (IE, DE, ZE) faults before the
+ *   result is computed, so only the pre-computation flags are recorded.
+ * (PE under an unmasked OE/UE is decided in sf_round_pack.) */
 static inline void sse_flags(x86_state *s, unsigned fl) {
+    unsigned um = ~(s->mxcsr >> 7) & 0x3fu;
+    if (fl & um & 0x07u) fl &= 0x07u;
     s->mxcsr |= fl & 0x3fu;
-    unsigned unmasked = fl & ~(s->mxcsr >> 7) & 0x3fu;
-    if (unmasked)
-        exe2mac_raise(s, (unmasked & (SF_IE | SF_DE | SF_ZE)) ? EXE2MAC_STATUS_FLOAT_MULTIPLE_FAULTS
-                                                              : EXE2MAC_STATUS_FLOAT_MULTIPLE_TRAPS,
-                      "unmasked SSE floating-point exception");
+    unsigned unmasked = fl & um;
+    if (unmasked) {
+        static const uint32_t status[6] = {
+            EXE2MAC_STATUS_FLOAT_INVALID_OPERATION, EXE2MAC_STATUS_FLOAT_DENORMAL_OPERAND,
+            EXE2MAC_STATUS_FLOAT_DIVIDE_BY_ZERO, EXE2MAC_STATUS_FLOAT_OVERFLOW,
+            EXE2MAC_STATUS_FLOAT_UNDERFLOW, EXE2MAC_STATUS_FLOAT_INEXACT_RESULT };
+        unsigned i = 0;
+        while (!(unmasked & (1u << i))) i++;
+        exe2mac_raise(s, status[i], "unmasked SSE floating-point exception");
+    }
 }
 
 static inline uint64_t sf_arith(const sf_fmt *f, const sf_env *e, uint64_t a, uint64_t b, int op, unsigned *fl) {

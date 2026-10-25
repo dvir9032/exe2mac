@@ -120,7 +120,7 @@ jobs:
         run: |
           ver="$(cmd.exe //c ver | tr -d '\r' | tr -s '\n' ' ')"
           status=0
-          for spec in hello:7 ops:102 switch:50 fp:27 io:5 vec:42 tail:13 mxcsr:180; do
+          for spec in hello:7 ops:102 switch:50 fp:27 io:5 vec:42 tail:13 mxcsr:142; do
             name=${spec%%:*}; want=${spec##*:}
             set +e
             if [ -f test/$name.windows.bat ]; then
@@ -143,4 +143,16 @@ jobs:
             if [ "$same" != MATCH ]; then diff $name.win.stdout test/golden/$name.stdout || true; status=1; fi
             [ "$code" -eq "$want" ] || status=1
           done
+          # xm.exe: one unmasked SSE exception per case -> full NTSTATUS per case
+          cmd.exe //c "test\\xm.windows.bat"
+          n=0
+          while read -r c v; do
+            [ -n "$c" ] || continue
+            n=$((n + 1))
+            got=$(printf '0x%08x' $(( v & 0xffffffff )))
+            want=$(awk -v c="$c" '$1 == c { print $2 }' test/golden/xm.codes)
+            res=MATCH; [ "$got" = "$want" ] || { res=MISMATCH; status=1; }
+            echo "::notice title=windows-reference-xm-$c::status=$got want=$want $res"
+          done < <(tr -d '\r' < xm.win.codes)
+          [ "$n" -eq "$(grep -c . test/golden/xm.codes)" ] || { echo "::error::xm: $n cases ran"; status=1; }
           exit $status

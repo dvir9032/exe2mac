@@ -301,7 +301,8 @@ class LiftedMXCSRTests(_SnippetCheck, unittest.TestCase):
 
     def test_unmasked_divide_by_zero_raises_simd_exception(self):
         r = snippet_exit_status("4883ec08c70424801d00000fae1424660fefc948b8000000000000f03f66480f6ec0f20f5ec14883c408c3")
-        self.assertEqual(r.returncode, 0xB4)                                   # STATUS_FLOAT_MULTIPLE_FAULTS & 0xff
+        self.assertEqual(r.returncode, 0x8E)                                   # STATUS_FLOAT_DIVIDE_BY_ZERO & 0xff
+        self.assertIn(b"0xc000008e", r.stderr)
         self.assertIn(b"unmasked SSE floating-point exception", r.stderr)
 
 

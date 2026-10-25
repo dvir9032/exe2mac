@@ -332,6 +332,34 @@ def discover(pe, strict_indirect_jumps: bool = False) -> Program:
 
 MAX_JUMP_TABLE_ENTRIES = 4096
 
+# Windows x64 callee-saved GPRs (hardware indices): RBX RBP RSI RDI R12-R15.
+_NONVOLATILE = frozenset({3, 5, 6, 7, 12, 13, 14, 15})
+
+
+def _upper_half_zero(d, preds, va, reg_index, limit=64):
+    """Prove that bits 32..63 of GPR `reg_index` are zero on entry to `va`:
+    walk back along a unique-predecessor chain to the last instruction that
+    writes the register; a 32-bit write zero-extends. Calls are crossed only
+    for callee-saved registers. Anything else -> False (no proof)."""
+    from .decoder import make_register
+    cur = va
+    for _ in range(limit):
+        ps = preds.get(cur, set())
+        if len(ps) != 1:
+            return False
+        (cur,) = ps
+        insn = d.insns[cur]
+        if insn.flow == FLOW_CALL:
+            if reg_index in _NONVOLATILE:
+                continue
+            return False
+        widths = [make_register(n).width for n in insn.regs_written
+                  if make_register(n).kind == "gpr" and make_register(n).index == reg_index]
+        if widths:
+            return widths == [32] and not any(make_register(n).high8 for n in insn.regs_written
+                                              if make_register(n).kind == "gpr")
+    return False
+
 
 def _match_jump_table(d, jmp, preds):
     """Recognise the bounded relative jump-table idiom ending at ``jmp``:
@@ -393,6 +421,8 @@ def _match_jump_table(d, jmp, preds):
     if idx_op.reg.width == 64:
         sym[idx_op.reg.index] = ("idx",)
     idx32 = idx_op.reg.index if idx_op.reg.width == 32 else None   # zero-extension still required
+    if idx32 is not None and _upper_half_zero(d, preds, cmp.address, idx32):
+        sym[idx32] = ("idx",)          # the full 64-bit register already equals the bounded index
 
     def regs(insn):
         return [o for o in insn.operands]

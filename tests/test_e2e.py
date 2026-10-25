@@ -206,9 +206,32 @@ class TailEndToEndTests(_FixtureE2E, unittest.TestCase):
 class MxcsrEndToEndTests(_FixtureE2E, unittest.TestCase):
     """test/mxcsr.c: rounding control, FTZ, DAZ, sticky flags, cvtsd2si per mode,
     then an unmasked divide-by-zero that ends the process with
-    STATUS_FLOAT_MULTIPLE_FAULTS (0xC00002B4 -> exit status 0xB4)."""
-    NAME, EXIT = "mxcsr", 0xB4
-    STDERR_HAS = b"0xc00002b4: unmasked SSE floating-point exception"
+    STATUS_FLOAT_DIVIDE_BY_ZERO (0xC000008E -> exit status 0x8E), as the
+    Windows reference job observed."""
+    NAME, EXIT = "mxcsr", 0x8E
+    STDERR_HAS = b"0xc000008e: unmasked SSE floating-point exception"
+
+
+@unittest.skipUnless(CC and dec.capstone is not None, "C compiler and capstone required")
+class UnmaskedExceptionEndToEndTests(unittest.TestCase):
+    """test/xm.c: one unmasked SSE exception per case; the process ends with
+    the NTSTATUS listed in test/golden/xm.codes (Windows CI compares the
+    original exe with the same file)."""
+
+    def test_each_cause_ends_with_its_status(self):
+        from recompiler.translate import build
+        with open(os.path.join(ROOT, "test", "golden", "xm.codes")) as f:
+            want = [line.split() for line in f if line.strip()]
+        with tempfile.TemporaryDirectory() as td:
+            exe = build(os.path.join(ROOT, "test", "xm.exe"), os.path.join(td, "xm"))
+            for case, status in want:
+                with self.subTest(case=case):
+                    r = subprocess.run([str(exe), case], capture_output=True, timeout=60)
+                    self.assertEqual(r.stdout, b"trapping\n")
+                    self.assertIn(f"{status}: unmasked SSE floating-point exception".encode(), r.stderr)
+                    self.assertEqual(r.returncode, int(status, 16) & 0xFF)
+            r = subprocess.run([str(exe), "9"], capture_output=True, timeout=60)   # no unmasked exception
+            self.assertEqual((r.stdout, r.returncode), (b"trapping\nno trap\n", 99))
 
 
 @unittest.skipUnless(shutil.which("clang") and dec.capstone is not None, "clang and capstone required")

@@ -9,6 +9,7 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -122,6 +123,17 @@ class CRuntimeSemanticsTests(unittest.TestCase):
             r = _build_best("diff_mxcsr.c", exe, ["-mno-red-zone"])
             self.assertEqual(r.returncode, 0, r.stderr)
             run = subprocess.run([exe], capture_output=True, text=True, timeout=1800)
+            self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+            self.assertIn("failures=0", run.stdout)
+
+    @unittest.skipUnless(platform.machine().lower() in ("x86_64", "amd64") and sys.platform.startswith("linux"),
+                         "unmasked-exception oracle needs an x86-64 Linux host (SIGFPE + ucontext MXCSR)")
+    def test_unmasked_exception_differential(self):
+        with tempfile.TemporaryDirectory() as td:
+            exe = os.path.join(td, "diff_xm")
+            r = _build("diff_xm.c", exe, ["-mno-red-zone"])     # no sanitizers: longjmp out of a signal handler
+            self.assertEqual(r.returncode, 0, r.stderr)
+            run = subprocess.run([exe], capture_output=True, text=True, timeout=900)
             self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
             self.assertIn("failures=0", run.stdout)
 

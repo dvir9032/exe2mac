@@ -78,7 +78,13 @@ Capstone Python bindings. On macOS: Xcode Command Line Tools.
   (`cmp idx, N; ja default; [mov r32, idx32]; lea B, [rip+T];
   movsxd R, [B + I*4]; add R, B; jmp R`) by symbolic evaluation of exactly
   these forms, takes the entry count from the bounds check, and reads the
-  int32 entries from the image. It verifies after discovery that no other edge
+  int32 entries from the image. When the bounds check is on a 32-bit register
+  and the load uses its 64-bit alias with no `mov r32` in between, the upper
+  half must be proved zero: the matcher walks back from the `cmp` along
+  unique-predecessor code (at most 64 instructions) to the last writer of the
+  register and accepts only a plain 32-bit write (which zero-extends); a `call`
+  may be crossed only for callee-saved registers (RBX RBP RSI RDI R12–R15).
+  Anything else is not a table. It verifies after discovery that no other edge
   enters the sequence between the bounds check and the `jmp`. The translated
   code executes the real table load and add, then `switch`es on the computed
   guest VA over the proven targets; any other value (e.g. a table rewritten at
@@ -136,9 +142,16 @@ Implemented exactly (defined flags computed; undefined flags left unchanged):
   indefinite for invalid operations. `ldmxcsr`/`stmxcsr` load/store the
   register (reserved bits → access violation); `cvtsd2si` uses the current
   rounding mode, `cvttsd2si` truncates. An exception whose mask bit is clear
-  raises #XM; without SEH this ends the process with
-  STATUS_FLOAT_MULTIPLE_FAULTS (0xC00002B4, for IE/DE/ZE) or
-  STATUS_FLOAT_MULTIPLE_TRAPS (0xC00002B5, for OE/UE/PE). The host FPU is not
+  raises #XM; without SEH this ends the process with the NTSTATUS of the
+  first unmasked flag in the order IE, DE, ZE, OE, UE, PE:
+  STATUS_FLOAT_INVALID_OPERATION 0xC0000090, _DENORMAL_OPERAND 0xC000008D,
+  _DIVIDE_BY_ZERO 0xC000008E (observed on Windows for test/mxcsr.exe),
+  _OVERFLOW 0xC0000091, _UNDERFLOW 0xC0000093, _INEXACT_RESULT 0xC000008F
+  (test/xm.exe checks each one on Windows CI). At the fault MXCSR holds what
+  hardware records: an unmasked IE/DE/ZE stops before the computation (only
+  pre-computation flags are set); an unmasked UE is raised on tininess alone,
+  exact or not, and bypasses FTZ; under an unmasked OE/UE, PE is set only if
+  the result rounded to p bits with an unbounded exponent is inexact. The host FPU is not
   used for guest arithmetic, so ARM64 results and flags are identical.
   Cost: software arithmetic is slower than native FP; there is no fast path
   yet. Generated C is still compiled with `-ffp-contract=off`.
@@ -174,7 +187,8 @@ unsupported imports, code relocations.
 | `test/fp.exe` | `EXTRA_CFLAGS=-fno-math-errno sh scripts/build_fixture.sh test/fp.c test/fp.exe` | exit 27 | `test/golden/fp_model.py` (SDM NaN rules) + Windows CI job |
 | `test/vec.exe` | `sh scripts/build_fixture.sh test/vec.c test/vec.exe` (auto-vectorised) | exit 42 | `test/golden/vec_model.py` + Windows CI job |
 | `test/tail.exe` | `sh scripts/build_fixture.sh test/tail.c test/tail.exe` | exit 13 | `test/golden/tail_model.py` + Windows CI job |
-| `test/mxcsr.exe` | `sh scripts/build_fixture.sh test/mxcsr.c test/mxcsr.exe` | ends with unmasked #XM: exit 0xB4 (Windows 0xC00002B4) | `test/golden/mxcsr_model.py` (exact rational arithmetic) + Windows CI job via `test/mxcsr.windows.bat` |
+| `test/mxcsr.exe` | `sh scripts/build_fixture.sh test/mxcsr.c test/mxcsr.exe` | ends with unmasked #XM: exit 0x8E (Windows 0xC000008E) | `test/golden/mxcsr_model.py` (exact rational arithmetic) + Windows CI job via `test/mxcsr.windows.bat` |
+| `test/xm.exe` | `sh scripts/build_fixture.sh test/xm.c test/xm.exe` | one unmasked SSE exception per case (argv[1] = 0..6) | `test/golden/xm.codes` (SDM priority) + Windows CI job via `test/xm.windows.bat` |
 | `test/io.exe` | `sh scripts/build_fixture.sh test/io.c test/io.exe` (default -O2, auto-vectorised) | exit 5 with args `alpha "b c" q\"uote "back\slash\\" ""` and stdin `test/golden/io.input` | `test/golden/io_model.py` + Windows CI job via `test/io.windows.bat` |
 
 ## Verification
@@ -186,6 +200,9 @@ unsupported imports, code relocations.
 * `tests/c/diff_mxcsr.c`: 19.8 M cases over all 16 RC×FTZ×DAZ settings,
   comparing result bits and MXCSR flags with hardware (mutation-checked);
   `tests/c/test_mxcsr.c` replays 640 hardware-recorded vectors on any host.
+* `tests/c/diff_xm.c`: 8.4 M cases with random unmasked exception sets
+  (2.9 M faulting) vs hardware: SIGFPE caught, the MXCSR saved at the fault
+  compared with the model's flags, status and result (x86-64 Linux only).
 * `tests/c/diff_x86.c`: 5.8 M cases against the real CPU (x86-64 hosts only;
   test-only oracle, never part of a translated program). Mutation-checked.
 * `tests/test_lifter.py`: lifted snippets compiled, executed, final state compared.

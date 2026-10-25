@@ -21,6 +21,18 @@ JT_OK = ("b902000000e8110000004889c3b909000000e8040000004889c6c383f903772a89c848
 JT_NOBOUND = "89c8488d150b000000486304824801d0ffe0c390feffffff"
 JT_BYPASS = "85c9780583f900771389c8488d150e000000486304824801d0ffe0c3c30f1f00fbffffff"
 JT_NOZEXT = "83f9007711488d150c0000004863048a4801d0ffe0c3c390fdffffff"
+# Zero-extension proved by an earlier 32-bit write: `mov ebx, 2; call f; cmp ebx, 3; ja; ...
+# movsxd rax, [rdx+rbx*4]`. RBX is callee-saved, so the call cannot change it.
+JT_ZEXT_NV = ("bb02000000e83300000083fb037728488d15280000004863049a4801d0ffe0b864000000c3b865000000c3"
+              "b866000000c3b867000000c3b8e7030000c3c3e1ffffffe7ffffffedfffffff3ffffff")
+# Same with RCX (volatile: the callee may leave garbage in bits 32..63) -> no proof.
+JT_ZEXT_VOL = ("b902000000e83300000083f9037728488d15280000004863048a4801d0ffe0b864000000c3b865000000c3"
+               "b866000000c3b867000000c3b8e7030000c3c3e1ffffffe7ffffffedfffffff3ffffff")
+# A 64-bit write (`add rbx, 1`) or a high-byte write (`mov bh, 0`) after the 32-bit one -> no proof.
+JT_ZEXT_W64 = ("bb02000000e8370000004883c30183fb037728488d15280000004863049a4801d0ffe0b864000000c3"
+               "b865000000c3b866000000c3b867000000c3b8e7030000c3c3e1ffffffe7ffffffedfffffff3ffffff")
+JT_ZEXT_H8 = ("bb02000000e835000000b70083fb037728488d15280000004863049a4801d0ffe0b864000000c3b865000000c3"
+              "b866000000c3b867000000c3b8e7030000c3c3e1ffffffe7ffffffedfffffff3ffffff")
 JT_RUNTIME = ("31c9488d15000000004c8d05f0ffffff4929d044890283f900771889c8488d1500000000"
               "486304824801d0ffe0b801000000c3c3")
 
@@ -82,6 +94,23 @@ class JumpTableCFGTests(unittest.TestCase):
             self.assertEqual(len(prog.dynamic_tail_jumps), 1)
             self.assertEqual(prog.jump_tables, {})
 
+    def test_zero_extension_proved_by_earlier_32bit_write(self):
+        prog = discover(JT_ZEXT_NV, strict=True)
+        (jt,) = prog.jump_tables.values()
+        self.assertEqual(jt.count, 4)
+
+    def test_zero_extension_proof_fails_closed(self):
+        for code in (JT_ZEXT_VOL, JT_ZEXT_W64, JT_ZEXT_H8):
+            prog = discover(code)
+            self.assertEqual(prog.jump_tables, {})
+            self.assertEqual(len(prog.dynamic_tail_jumps), 1)
+
+    def test_xm_fixture_table(self):
+        from recompiler.cfg import discover as d
+        from recompiler.pe import PE
+        prog = d(PE(os.path.join(ROOT, "test", "xm.exe")), strict_indirect_jumps=True)
+        self.assertEqual([j.count for j in prog.jump_tables.values()], [7])   # `cmovb edi, eax` proves rdi < 2^32
+
     def test_index_without_zero_extension_is_rejected(self):
         from recompiler.cfg import CFGError
         with self.assertRaisesRegex(CFGError, "unexpected table load"):
@@ -90,6 +119,10 @@ class JumpTableCFGTests(unittest.TestCase):
 
 @unittest.skipUnless(CC and dec.capstone is not None, "C compiler and capstone required")
 class JumpTableExecutionTests(_SnippetCheck, unittest.TestCase):
+    def test_table_with_zero_extension_proved_earlier(self):
+        table = BASE + TEXT_RVA + len(bytes.fromhex(JT_ZEXT_NV)) - 16
+        self.check(JT_ZEXT_NV, {"rax": 102, "rbx": 2, "rdx": table})
+
     def test_in_range_and_default_paths(self):
         self.check(JT_OK, {"rbx": 102, "rsi": 999, "rax": 999, "rcx": 9, "rdx": 0},
                    {"cf": 0, "pf": 1, "af": 0, "zf": 1, "sf": 0, "of": 0})   # from `xor edx, edx`
