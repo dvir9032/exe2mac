@@ -79,5 +79,13 @@ packed-integer instructions); `test/io.exe` is now built with default -O2.
 - macOS ARM64: 113 tests OK (3 x86-only differential skips), incl. vec and io end-to-end
 - Linux x86-64: 113 tests OK (1 macOS-only skip); packed differential 18,617,984 cases, 0 failures
 
+## Tail calls — run 40189326587 (2026-10-25)
+Fixture `test/tail.exe`: one-million-deep direct mutual tail recursion and an
+indirect tail-call state machine, tail calls into imports (incl. ExitProcess),
+function pointers from `lea [rip+code]` and from a pointer table.
+- Windows reference: exit 13, stdout sha256 `72865b4…` = golden (69 bytes)
+- macOS ARM64: 122 tests OK (3 x86-only differential skips), incl. tail end-to-end
+- Linux x86-64: 122 tests OK (1 macOS-only skip)
+
 ## Not implemented
 See "Limitations" in `docs/TRANSLATION.md`. 

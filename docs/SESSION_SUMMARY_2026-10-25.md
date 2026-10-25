@@ -95,6 +95,14 @@ executables (no Wine, no CPU emulation at run time). First fixture:
     overflow / negative left shift (UB) and was fixed before its golden was made.
     A weakly covered sticky-bit path in `cvtsi2ss` got exact directed tests.
 
+15. **Tail calls.** Direct tail jumps are absorbed into the caller's C function
+    (loops, no host recursion); indirect and IAT tail jumps use a trampoline
+    (`x86_state.tail`, `exe2mac_run_tail`). Non-table indirect jmps are dynamic
+    tail calls by default (run-time fault on non-entry targets) with
+    `--strict-indirect-jumps` restoring translation-time rejection. A first
+    version made every `lea [rip+code]` target a hard root, which decoded an
+    in-.text jump table as code; candidates are now transactional.
+
 ## Open items / caveats
 - Golden output now confirmed on Windows (see `test/golden/README.md`).
 - Undefined x86 flags are left unchanged (a legal outcome).
@@ -110,5 +118,5 @@ limitations), `docs/DECODER_CFG.md`, `runtime/README.md`,
 Remill Apache-2.0 used only as architectural references, no code copied).
 
 ## Next step
-Tail calls between functions; then MXCSR modelling, more SSE (SSSE3/SSE4 need
-a CPU-feature decision, since CPUID is not modelled).
+MXCSR modelling (ldmxcsr/stmxcsr, rounding modes, cvtsd2si); CPUID and
+SSSE3/SSE4 (needs a decision on the advertised CPU features); more imports.
