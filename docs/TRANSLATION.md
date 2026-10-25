@@ -93,12 +93,25 @@ Implemented exactly (defined flags computed; undefined flags left unchanged):
   `imul r, r/m` / `imul r, r/m, imm`, `div`/`idiv r/m32|64`
   (#DE → 0xC0000094 / 0xC0000095), `cdq cqo`
 * strings: `rep stosb`, `rep movsb` (byte-exact, honours DF, overlap-safe)
-* SSE: `movaps` xmm↔m128 (16-byte alignment enforced → access violation) and xmm↔xmm
+* SSE/SSE2 (scalar): `addsd subsd mulsd divsd sqrtsd minsd maxsd`, `addss subss mulss divss`,
+  `ucomisd comisd`, `cmpsd`/`cmpXXsd` (8 predicates), `cvtsi2sd` (r/m32|64),
+  `cvttsd2si` (r32|64), `cvtsd2ss cvtss2sd`, `movsd movss movd movq`,
+  128-bit moves `movaps movapd movdqa` (aligned) / `movups movupd movdqu`,
+  bitwise `xorps/pd andps/pd andnps/pd orps/pd pxor pand pandn por`.
+  Exact x86 rules are implemented in `runtime/x86_sse.h`: NaN propagation
+  (first operand wins, quieted), QNaN indefinite `0xFFF8000000000000` for
+  invalid operations, integer indefinite for NaN/out-of-range conversions,
+  min/max operand selection, which part of the destination each form writes,
+  and 16-byte alignment of legacy-SSE m128 operands (→ access violation).
+  Assumes the default MXCSR (round-to-nearest, no FTZ/DAZ, exceptions masked);
+  MXCSR is not modelled, so `ldmxcsr`/`stmxcsr`, `cvtsd2si` (current rounding
+  mode), packed arithmetic and x87 are rejected. Generated C is compiled with
+  `-ffp-contract=off`.
 * control flow: `jcc` (all 16), `jmp rel`, `call rel/reg/mem`, `ret`,
   `nop` (any form; never touches memory)
 
 Rejected with `TranslationError` (address + bytes in the message): anything else
-(e.g. `bt`, `rol/ror`, `movups` and other SSE/x87, `rep stosd`, `repne scasb`),
+(e.g. `bt`, `rol/ror`, packed SSE arithmetic, x87, `rep stosd`, `repne scasb`),
 LOCK prefixes, address-size override, FS/GS segment overrides, absolute
 `[disp32]` operands, one-operand `imul`, `ret imm16`, indirect `jmp` other than
 recognised jump tables,
@@ -110,9 +123,12 @@ unsupported imports, code relocations.
 | `test/hello.exe` | supplied | exit 7 | source-derived, confirmed on Windows CI |
 | `test/ops.exe` | `sh scripts/build_fixture.sh test/ops.c test/ops.exe` (clang + lld-link, -O2) | exit 102 | `test/golden/ops_model.py` (independent Python model of the C semantics) + Windows CI job |
 | `test/switch.exe` | `sh scripts/build_fixture.sh test/switch.c test/switch.exe` | exit 50 | `test/golden/switch_model.py` + Windows CI job |
+| `test/fp.exe` | `EXTRA_CFLAGS=-fno-math-errno sh scripts/build_fixture.sh test/fp.c test/fp.exe` | exit 27 | `test/golden/fp_model.py` (SDM NaN rules) + Windows CI job |
 
 ## Verification
 * `tests/c/test_cpu.c`: SDM-derived expected values for every helper (any host).
+* `tests/c/test_sse.c` (portable, SDM-derived) and `tests/c/diff_sse.c`
+  (8.1 M cases vs the real SSE unit, x86 hosts only).
 * `tests/c/diff_x86.c`: 5.8 M cases against the real CPU (x86-64 hosts only;
   test-only oracle, never part of a translated program). Mutation-checked.
 * `tests/test_lifter.py`: lifted snippets compiled, executed, final state compared.

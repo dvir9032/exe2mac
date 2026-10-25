@@ -18,7 +18,7 @@ Implement `exe2mac`: static recompilation of supported Windows PE32+ x86-64 prog
 - Runtime: `runtime/` (see `runtime/README.md`); design and supported forms: `docs/TRANSLATION.md`.
 - `test/hello.exe` translates, builds and runs correctly on Linux x86-64 and on macOS ARM64
   (GitHub Actions macos-14, Apple M1): stdout byte-identical, exit 7 — see `STAGE3_STATUS.md`.
-- Tests: `python3 -m unittest discover -s tests -v` (95 tests in the prepared Linux environment, 1 macOS-only skip).
+- Tests: `python3 -m unittest discover -s tests -v` (104 tests in the prepared Linux environment, 1 macOS-only skip).
 
 ## Definition of done for the first useful milestone
 - Translate the reachable code of `test/hello.exe` into generated C or LLVM IR and then native ARM64 code.

@@ -35,10 +35,10 @@ def build_snippet(code_hex, td, imports=(), rdata=b"", data=b""):
     exe = os.path.join(td, "snip")
     with open(c, "w") as f:
         f.write(Lifter(pe, discover(pe)).emit())
-    cmd = [CC, "-std=c11", "-D_DEFAULT_SOURCE", "-O1", "-Wall", "-Wextra", "-Werror",
+    cmd = [CC, "-std=c11", "-D_DEFAULT_SOURCE", "-O1", "-Wall", "-Wextra", "-Werror", "-ffp-contract=off",
            "-I", ROOT, "-I", os.path.join(ROOT, "runtime"), c,
            os.path.join(ROOT, "tests", "c", "snippet_main.c"),
-           *[os.path.join(ROOT, "runtime", r) for r in RUNTIME], "-o", exe]
+           *[os.path.join(ROOT, "runtime", r) for r in RUNTIME], "-lm", "-o", exe]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode:
         raise AssertionError(r.stderr)
@@ -52,22 +52,8 @@ def snippet_exit_status(code_hex, data=b""):
 
 
 def run_snippet(code_hex, imports=(), rdata=b""):
-    from recompiler.lift_c import Lifter
-    from recompiler.cfg import discover
-    pe = FakePE(bytes.fromhex(code_hex), rdata=rdata, imports=imports)
-    c_src = Lifter(pe, discover(pe)).emit()
     with tempfile.TemporaryDirectory() as td:
-        c = os.path.join(td, "snip.gen.c")
-        exe = os.path.join(td, "snip")
-        with open(c, "w") as f:
-            f.write(c_src)
-        cmd = [CC, "-std=c11", "-D_DEFAULT_SOURCE", "-O1", "-Wall", "-Wextra", "-Werror",
-               "-I", ROOT, "-I", os.path.join(ROOT, "runtime"), c,
-               os.path.join(ROOT, "tests", "c", "snippet_main.c"),
-               *[os.path.join(ROOT, "runtime", r) for r in RUNTIME], "-o", exe]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode:
-            raise AssertionError(r.stderr)
+        exe = build_snippet(code_hex, td, imports=imports, rdata=rdata)
         run = subprocess.run([exe], capture_output=True, text=True, timeout=30)
     if run.returncode:
         raise AssertionError(f"snippet exited {run.returncode}: {run.stderr}")
@@ -207,12 +193,56 @@ class LiftedSnippetTestsWave2(_SnippetCheck, unittest.TestCase):
     def test_misaligned_movaps_faults(self):
         r = snippet_exit_status("4883ec080f284424084883c408c3")
         self.assertEqual(r.returncode, 0x05)               # STATUS_ACCESS_VIOLATION & 0xff
-        self.assertIn(b"movaps: misaligned", r.stderr)
+        self.assertIn(b"misaligned", r.stderr)
 
     def test_unsigned_divide_by_zero_faults(self):
         r = snippet_exit_status("31c931d2b801000000f7f1c3")
         self.assertEqual(r.returncode, 0x94)               # STATUS_INTEGER_DIVIDE_BY_ZERO & 0xff
         self.assertIn(b"div32: divide by zero", r.stderr)
+
+
+@unittest.skipUnless(CC and dec.capstone is not None, "C compiler and capstone required")
+class LiftedSSETests(_SnippetCheck, unittest.TestCase):
+    """Scalar SSE: which part of the destination register each form writes."""
+
+    UPPER = ("4883ec2848b800000000000000404889042448b8aaaaaaaaaaaaaaaa48894424080f280424f20f100c24"
+             "48b8000000000000f03f66480f6ed0f20f58c20f28d8f20f10da0f28e0f20f51e10f28e8b9f9fffffff20f2ae9"
+             "f2440f2cc50f28f0f20f5af2660f2ed10f92c2400f94c766490f7ec10f294424104c8b54241866490f7edb"
+             "66490f7ee466490f7eed66490f7ef666410f7ef766480f7ecb0f294c2410488b7424184883c428c3")
+
+    def test_scalar_writes_preserve_or_zero_the_upper_half(self):
+        t = texts(self.UPPER)
+        for want in ("movsd xmm1, qword ptr [rsp]", "addsd xmm0, xmm2", "movsd xmm3, xmm2", "sqrtsd xmm4, xmm1",
+                     "cvtsi2sd xmm5, ecx", "cvttsd2si r8d, xmm5", "cvtsd2ss xmm6, xmm2", "ucomisd xmm2, xmm1",
+                     "movd r15d, xmm6", "movq r9, xmm0"):
+            self.assertIn(want, t)
+        self.check(self.UPPER, {
+            "rax": 0x3FF0000000000000,
+            "rdx": 1,                        # setb after ucomisd 1.0 vs 2.0 (CF=1)
+            "rdi": 0,                        # sete: ZF=0
+            "rcx": 0xFFFFFFF9, "r8": 0xFFFFFFF9,       # cvttsd2si r32 zero-extends
+            "r9": 0x4008000000000000,        # 2.0 + 1.0
+            "r10": 0xAAAAAAAAAAAAAAAA,       # addsd kept xmm0's high qword
+            "r11": 0x3FF0000000000000,       # movsd xmm, xmm merges only the low qword
+            "r12": 0x3FF6A09E667F3BCD,       # sqrt(2.0)
+            "r13": 0xC01C000000000000,       # cvtsi2sd(-7)
+            "r14": 0x400800003F800000,       # cvtsd2ss writes only bits 0..31
+            "r15": 0x3F800000,
+            "rbx": 0x4000000000000000,
+            "rsi": 0,                        # movsd xmm, m64 zeroed the high qword
+        }, {"cf": 0, "pf": 1, "af": 0, "zf": 0, "sf": 0, "of": 0})   # from the final `add rsp, 0x28`
+
+    def test_unaligned_movups_is_allowed(self):
+        self.check("4883ec2848c7442408050000000f1044240866480f7ec04883c428c3", {"rax": 5},
+                   {"cf": 0, "pf": 1, "af": 0, "zf": 0, "sf": 0, "of": 0})
+
+    def test_misaligned_legacy_sse_memory_operand_faults(self):
+        r = snippet_exit_status("4883ec080f574424084883c408c3")        # xorps xmm0, [rsp+8]
+        self.assertEqual(r.returncode, 0x05)
+        self.assertIn(b"misaligned 128-bit operand", r.stderr)
+
+    def test_fp_fixture_end_to_end_lives_in_test_e2e(self):
+        self.assertTrue(os.path.exists(os.path.join(ROOT, "test", "fp.exe")))
 
 
 @unittest.skipUnless(dec.capstone is not None, "capstone required")
@@ -231,7 +261,12 @@ class FailClosedLifterTests(unittest.TestCase):
     def test_unsupported_instruction(self):
         self.assertRejected("480fa3c8c3", "unsupported instruction.*bt")         # bt rax, rcx
         self.assertRejected("48d1c0c3", "unsupported instruction.*rol")          # rol rax, 1
-        self.assertRejected("0f1000c3", "register xmm0 is not supported")       # movups xmm0, [rax]
+        self.assertRejected("0f58c1c3", "register xmm0 is not supported")       # addps (packed single)
+
+    def test_unsupported_sse(self):
+        self.assertRejected("f20f2dc0c3", "register xmm0 is not supported")      # cvtsd2si (rounding mode)
+        self.assertRejected("660f58c1c3", "register xmm0 is not supported")      # addpd (packed)
+        self.assertRejected("0fae1424c3", "unsupported instruction.*ldmxcsr")    # MXCSR changes
 
     def test_rep_prefix(self):
         self.assertRejected("f3abc3", "REP")                                     # rep stosd (only stosb/movsb)

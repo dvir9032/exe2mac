@@ -120,7 +120,7 @@ jobs:
         run: |
           ver="$(cmd.exe //c ver | tr -d '\r' | tr -s '\n' ' ')"
           status=0
-          for spec in hello:7 ops:102 switch:50; do
+          for spec in hello:7 ops:102 switch:50 fp:27; do
             name=${spec%%:*}; want=${spec##*:}
             set +e
             ./test/$name.exe > $name.win.stdout 2> $name.win.stderr

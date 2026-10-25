@@ -155,6 +155,13 @@ class SwitchEndToEndTests(_FixtureE2E, unittest.TestCase):
     NAME, EXIT = "switch", 50
 
 
+@unittest.skipUnless(CC and dec.capstone is not None, "C compiler and capstone required")
+class FpEndToEndTests(_FixtureE2E, unittest.TestCase):
+    """test/fp.c: scalar SSE double/float arithmetic, sqrt, min/max, compares,
+    conversions; results printed as exact IEEE-754 bit patterns."""
+    NAME, EXIT = "fp", 27
+
+
 @unittest.skipUnless(shutil.which("clang") and dec.capstone is not None, "clang and capstone required")
 class MacOSArm64CompileOnlyTests(unittest.TestCase):
     """COMPILE-ONLY check that the generated C targets arm64-apple-macos.

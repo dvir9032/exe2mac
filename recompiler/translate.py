@@ -60,12 +60,13 @@ def default_cc() -> str:
 def compile_c(c_path, out_path, cc=None, extra_flags=(), opt="-O2"):
     """Compile generated C plus the runtime into a native executable."""
     cc = cc or default_cc()
-    flags = ["-std=c11", "-D_DEFAULT_SOURCE", opt, "-Wall", "-Wextra",
+    # -ffp-contract=off: never fuse guest MUL+ADD into a host FMA (different rounding).
+    flags = ["-std=c11", "-D_DEFAULT_SOURCE", opt, "-Wall", "-Wextra", "-ffp-contract=off",
              "-I", str(ROOT), "-I", str(ROOT / "runtime")]
     if platform.system() == "Darwin" and platform.machine() == "arm64":
         flags += ["-arch", "arm64"]
     cmd = [cc, *flags, *extra_flags, str(c_path),
-           *[str(ROOT / "runtime" / s) for s in RUNTIME_SOURCES], "-o", str(out_path)]
+           *[str(ROOT / "runtime" / s) for s in RUNTIME_SOURCES], "-lm", "-o", str(out_path)]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise TranslationError("C compilation failed:\n" + " ".join(cmd) + "\n" + r.stderr)

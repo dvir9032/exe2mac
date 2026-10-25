@@ -39,6 +39,20 @@ BINOPS = {"add": "x86_add", "sub": "x86_sub", "and": "x86_and", "or": "x86_or", 
           "adc": "x86_adc", "sbb": "x86_sbb"}
 SHIFTS = {"shr": "x86_shr", "shl": "x86_shl", "sal": "x86_shl", "sar": "x86_sar"}
 STRING_OPS = {"rep stosb": "x86_rep_stosb", "rep movsb": "x86_rep_movsb"}
+
+# ---- SSE / SSE2 ---------------------------------------------------------------
+SSE_ARITH_SD = {"addsd": "SSE_ADD", "subsd": "SSE_SUB", "mulsd": "SSE_MUL", "divsd": "SSE_DIV"}
+SSE_ARITH_SS = {"addss": "SSE_ADD", "subss": "SSE_SUB", "mulss": "SSE_MUL", "divss": "SSE_DIV"}
+SSE_MOV128_ALIGNED = {"movaps", "movapd", "movdqa"}
+SSE_MOV128_UNALIGNED = {"movups", "movupd", "movdqu"}
+SSE_BITWISE = {"xorps": "^", "xorpd": "^", "pxor": "^", "andps": "&", "andpd": "&", "pand": "&",
+               "orps": "|", "orpd": "|", "por": "|", "andnps": "&~", "andnpd": "&~", "pandn": "&~"}
+SSE_CMP_SD = {"cmpeqsd": 0, "cmpltsd": 1, "cmplesd": 2, "cmpunordsd": 3,
+              "cmpneqsd": 4, "cmpnltsd": 5, "cmpnlesd": 6, "cmpordsd": 7}
+SSE_MNEMONICS = (set(SSE_ARITH_SD) | set(SSE_ARITH_SS) | SSE_MOV128_ALIGNED | SSE_MOV128_UNALIGNED
+                 | set(SSE_BITWISE) | set(SSE_CMP_SD)
+                 | {"movsd", "movss", "movd", "movq", "sqrtsd", "minsd", "maxsd", "ucomisd", "comisd",
+                    "cmpsd", "cvtsd2ss", "cvtss2sd", "cvtsi2sd", "cvttsd2si"})
 CMPOPS = {"cmp": "x86_sub", "test": "x86_and"}
 UNOPS = {"inc": "x86_inc", "dec": "x86_dec", "neg": "x86_neg"}
 
@@ -80,7 +94,7 @@ class _Fn:
         for op in self.insn.operands:
             if op.kind == "mem" and op.mem.segment is not None:
                 raise _err(self.insn, f"segment override {op.mem.segment.name} is not supported")
-            if op.kind == "reg" and op.reg.kind != "gpr" and not (op.reg.kind == "xmm" and mn == "movaps"):
+            if op.kind == "reg" and op.reg.kind != "gpr" and not (op.reg.kind == "xmm" and mn in SSE_MNEMONICS):
                 raise _err(self.insn, f"register {op.reg.name} is not supported")
 
     def ea(self, op: Operand) -> str:
@@ -275,19 +289,6 @@ class Lifter:
         elif mn in STRING_OPS:
             f.emit(f"s->rip = {self.va_expr(insn.address)};")
             f.emit(f"{STRING_OPS[mn]}(s);")
-        elif mn == "movaps":
-            dst, src = f.need(2)
-            f.emit(f"s->rip = {self.va_expr(insn.address)};")
-            if dst.kind == "reg" and src.kind == "mem":
-                f.emit(f"x86_ld128(s, {dst.reg.index}, {f.ea(src)}, 1);")
-            elif dst.kind == "mem" and src.kind == "reg":
-                f.emit(f"x86_st128(s, {src.reg.index}, {f.ea(dst)}, 1);")
-            elif dst.kind == "reg" and src.kind == "reg":
-                f.emit(f"s->xmm[{dst.reg.index}] = s->xmm[{src.reg.index}];")
-            else:
-                raise _err(insn, "invalid movaps form")
-            if any(o.kind == "reg" and o.reg.kind != "xmm" for o in (dst, src)):
-                raise _err(insn, "movaps operand must be an XMM register")
         elif mn == "mul":
             (src,) = f.need(1)
             if src.size not in (4, 8):
@@ -332,6 +333,9 @@ class Lifter:
             # a 32-bit destination is zero-extended whether or not the move happens
             f.emit(f"t = {f.read(src)};")
             f.emit(f.write(dst, f"x86_cond(s, {COND_NAMES[COND[mn[4:]]]}) ? t : {f.read(dst)}"))
+        elif mn in SSE_MNEMONICS and any(o.kind == "reg" and o.reg.kind == "xmm" for o in ops):
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            self.lift_sse(f, insn)
         elif mn == "push":
             (src,) = f.need(1)
             if src.size != 8:
@@ -382,6 +386,151 @@ class Lifter:
         else:
             raise _err(insn, "unsupported instruction")
         return f.lines
+
+    # ---- SSE ------------------------------------------------------------------
+    def lift_sse(self, f: _Fn, insn: Instruction):
+        mn, ops = insn.mnemonic, insn.operands
+
+        def xmm(op):
+            if op.kind != "reg" or op.reg.kind != "xmm":
+                raise _err(insn, "expected an XMM register operand")
+            return op.reg.index
+
+        def src64(op):            # scalar double source: xmm low qword or m64
+            if op.kind == "reg":
+                return f"s->xmm[{xmm(op)}].lo"
+            if op.kind == "mem" and op.size == 8:
+                return f"guest_ld64(s->mem, {f.ea(op)})"
+            raise _err(insn, "expected xmm or m64 source")
+
+        def src32(op):            # scalar float source: xmm low dword or m32
+            if op.kind == "reg":
+                return f"(uint32_t)s->xmm[{xmm(op)}].lo"
+            if op.kind == "mem" and op.size == 4:
+                return f"(uint32_t)guest_ld32(s->mem, {f.ea(op)})"
+            raise _err(insn, "expected xmm or m32 source")
+
+        def src128(op, aligned):  # into locals lo/hi
+            if op.kind == "reg":
+                f.emit(f"{{ uint64_t lo = s->xmm[{xmm(op)}].lo, hi = s->xmm[{xmm(op)}].hi;")
+            elif op.kind == "mem" and op.size == 16:
+                f.emit(f"{{ uint64_t lo, hi; sse_ld128(s, {f.ea(op)}, {int(aligned)}, &lo, &hi);")
+            else:
+                raise _err(insn, "expected xmm or m128 source")
+
+        if mn in SSE_ARITH_SD:                      # low qword = op(dst, src); high preserved
+            dst, src = f.need(2)
+            d = xmm(dst)
+            f.emit(f"s->xmm[{d}].lo = sse_f64_arith(s->xmm[{d}].lo, {src64(src)}, {SSE_ARITH_SD[mn]});")
+        elif mn in SSE_ARITH_SS:                    # low dword only
+            dst, src = f.need(2)
+            d = xmm(dst)
+            f.emit(f"xmm_set_lo32(s, {d}, sse_f32_arith((uint32_t)s->xmm[{d}].lo, {src32(src)}, {SSE_ARITH_SS[mn]}));")
+        elif mn == "sqrtsd":
+            dst, src = f.need(2)
+            f.emit(f"s->xmm[{xmm(dst)}].lo = sse_f64_sqrt({src64(src)});")
+        elif mn in ("minsd", "maxsd"):
+            dst, src = f.need(2)
+            d = xmm(dst)
+            f.emit(f"s->xmm[{d}].lo = sse_f64_{mn[:3]}(s->xmm[{d}].lo, {src64(src)});")
+        elif mn in ("ucomisd", "comisd"):
+            a, b = f.need(2)
+            f.emit(f"sse_f64_ucomi(s, s->xmm[{xmm(a)}].lo, {src64(b)});")
+        elif mn in SSE_CMP_SD or mn == "cmpsd":
+            if mn == "cmpsd":
+                dst, src, imm = f.need(3)
+                if imm.kind != "imm" or imm.imm > 7:
+                    raise _err(insn, "cmpsd predicate must be 0..7")
+                pred = imm.imm
+            else:
+                dst, src = f.need(2)
+                pred = SSE_CMP_SD[mn]
+            d = xmm(dst)
+            f.emit(f"s->xmm[{d}].lo = sse_f64_cmp(s->xmm[{d}].lo, {src64(src)}, {pred}u);")
+        elif mn == "movsd":
+            dst, src = f.need(2)
+            if dst.kind == "reg" and src.kind == "mem":       # load: zero the high qword
+                f.emit(f"xmm_set_lo64_zero_hi(s, {xmm(dst)}, {src64(src)});")
+            elif dst.kind == "mem" and src.kind == "reg":
+                if dst.size != 8:
+                    raise _err(insn, "movsd store must be m64")
+                f.emit(f"guest_st64(s->mem, {f.ea(dst)}, s->xmm[{xmm(src)}].lo);")
+            elif dst.kind == "reg" and src.kind == "reg":     # register form merges the low qword
+                f.emit(f"xmm_set_lo64(s, {xmm(dst)}, s->xmm[{xmm(src)}].lo);")
+            else:
+                raise _err(insn, "invalid movsd form")
+        elif mn == "movss":
+            dst, src = f.need(2)
+            if dst.kind == "reg" and src.kind == "mem":
+                f.emit(f"xmm_set_lo32_zero_rest(s, {xmm(dst)}, {src32(src)});")
+            elif dst.kind == "mem" and src.kind == "reg":
+                if dst.size != 4:
+                    raise _err(insn, "movss store must be m32")
+                f.emit(f"guest_st32(s->mem, {f.ea(dst)}, (uint32_t)s->xmm[{xmm(src)}].lo);")
+            elif dst.kind == "reg" and src.kind == "reg":
+                f.emit(f"xmm_set_lo32(s, {xmm(dst)}, (uint32_t)s->xmm[{xmm(src)}].lo);")
+            else:
+                raise _err(insn, "invalid movss form")
+        elif mn in ("movd", "movq"):
+            dst, src = f.need(2)
+            width = 32 if mn == "movd" else 64
+            if dst.kind == "reg" and dst.reg.kind == "xmm":   # into xmm: zero the rest
+                if src.kind == "reg" and src.reg.kind == "gpr" and src.reg.width == width:
+                    v = f.read(src)
+                elif src.kind == "mem" and src.size == width // 8:
+                    v = f.read(src)
+                elif src.kind == "reg" and src.reg.kind == "xmm" and mn == "movq":
+                    v = f"s->xmm[{xmm(src)}].lo"
+                else:
+                    raise _err(insn, f"invalid {mn} form")
+                f.emit(f"xmm_set_lo64_zero_hi(s, {xmm(dst)}, {v});")
+            elif src.kind == "reg" and src.reg.kind == "xmm":  # out of xmm
+                v = f"s->xmm[{xmm(src)}].lo" + (" & 0xffffffffu" if width == 32 else "")
+                if dst.kind == "reg" and dst.reg.kind == "gpr" and dst.reg.width == width:
+                    f.emit(f.write(dst, v))                   # 32-bit GPR write zero-extends
+                elif dst.kind == "mem" and dst.size == width // 8:
+                    f.emit(f.write(dst, v))
+                else:
+                    raise _err(insn, f"invalid {mn} form")
+            else:
+                raise _err(insn, f"invalid {mn} form")
+        elif mn in SSE_MOV128_ALIGNED or mn in SSE_MOV128_UNALIGNED:
+            dst, src = f.need(2)
+            aligned = mn in SSE_MOV128_ALIGNED
+            if dst.kind == "reg":
+                src128(src, aligned)
+                f.emit(f"  s->xmm[{xmm(dst)}].lo = lo; s->xmm[{xmm(dst)}].hi = hi; }}")
+            elif dst.kind == "mem" and src.kind == "reg" and dst.size == 16:
+                f.emit(f"x86_st128(s, {xmm(src)}, {f.ea(dst)}, {int(aligned)});")
+            else:
+                raise _err(insn, f"invalid {mn} form")
+        elif mn in SSE_BITWISE:
+            dst, src = f.need(2)
+            d = xmm(dst)
+            src128(src, True)                       # legacy-SSE m128 operands must be aligned
+            o = SSE_BITWISE[mn]
+            if o == "&~":
+                f.emit(f"  s->xmm[{d}].lo = ~s->xmm[{d}].lo & lo; s->xmm[{d}].hi = ~s->xmm[{d}].hi & hi; }}")
+            else:
+                f.emit(f"  s->xmm[{d}].lo {o}= lo; s->xmm[{d}].hi {o}= hi; }}")
+        elif mn == "cvtsd2ss":
+            dst, src = f.need(2)
+            f.emit(f"xmm_set_lo32(s, {xmm(dst)}, sse_cvtsd2ss({src64(src)}));")
+        elif mn == "cvtss2sd":
+            dst, src = f.need(2)
+            f.emit(f"xmm_set_lo64(s, {xmm(dst)}, sse_cvtss2sd({src32(src)}));")
+        elif mn == "cvtsi2sd":
+            dst, src = f.need(2)
+            if src.kind not in ("reg", "mem") or src.size not in (4, 8) or (src.kind == "reg" and src.reg.kind != "gpr"):
+                raise _err(insn, "cvtsi2sd source must be r/m32 or r/m64")
+            f.emit(f"xmm_set_lo64(s, {xmm(dst)}, sse_cvtsi2sd({f.read(src)}, {src.bits}));")
+        elif mn == "cvttsd2si":
+            dst, src = f.need(2)
+            if dst.kind != "reg" or dst.reg.kind != "gpr" or dst.reg.width not in (32, 64):
+                raise _err(insn, "cvttsd2si destination must be r32 or r64")
+            f.emit(f.write(dst, f"sse_cvttsd2si({src64(src)}, {dst.reg.width})"))
+        else:
+            raise _err(insn, "unsupported SSE instruction")
 
     def lift_call(self, f: _Fn, insn: Instruction):
         ret = self.va_expr(insn.next)
@@ -477,6 +626,7 @@ class Lifter:
         L = ["/* Generated by exe2mac (static recompilation of a PE32+ x86-64 image).",
              " * Do not edit. Guest state lives in x86_state; see runtime/x86_cpu.h. */",
              '#include "runtime/exe2mac_rt.h"',
+             '#include "runtime/x86_sse.h"',
              "",
              "#define B g_exe2mac_base",
              ""]
