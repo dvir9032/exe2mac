@@ -122,8 +122,11 @@ jobs:
           ./test/hello.exe > win.stdout 2> win.stderr
           code=$?
           set -e
-          same=MISMATCH; cmp -s win.stdout test/golden/hello.stdout && same=MATCH
-          ver="$(cmd.exe /c ver | tr -d '\r' | tr -s '\n' ' ')"
-          echo "::notice title=windows-reference::host=$ver $(uname -m) | exit=$code | stdout=$same | bytes=$(wc -c < win.stdout | tr -d ' ') | sha256=$(sha256sum < win.stdout | cut -c1-16) | stderr_bytes=$(wc -c < win.stderr | tr -d ' ')"
+          echo "cmp available: $(command -v cmp || echo no)"
+          h_win=$(sha256sum < win.stdout | cut -d' ' -f1)
+          h_gold=$(sha256sum < test/golden/hello.stdout | cut -d' ' -f1)
+          same=MISMATCH; [ "$h_win" = "$h_gold" ] && same=MATCH
+          ver="$(cmd.exe //c ver | tr -d '\r' | tr -s '\n' ' ')"
+          echo "::notice title=windows-reference::host=$ver $(uname -m) | exit=$code | stdout=$same | bytes=$(wc -c < win.stdout | tr -d ' ') | sha256=$h_win golden=$h_gold | cmp=$(command -v cmp || echo none) | stderr_bytes=$(wc -c < win.stderr | tr -d ' ')"
           od -c win.stdout | head -20
           [ "$code" -eq 7 ] && [ "$same" = MATCH ]
