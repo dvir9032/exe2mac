@@ -1,0 +1,4 @@
+# Byte-exact fixtures: never convert line endings.
+test/golden/* -text
+*.exe binary
+*.obj binary
