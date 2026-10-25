@@ -182,13 +182,16 @@ def discover(pe, strict_indirect_jumps: bool = False) -> Program:
         if d.in_code(value):
             pointer_roots.append(value)
 
-    func_queue = [entry] + sorted(set(pointer_roots))
+    # Relocated pointers into executable sections are candidate roots, like
+    # `lea [rip + code]`: compilers also place data (strings, tables) in .text,
+    # so they are explored transactionally below, not trusted.
+    func_queue = [entry]
     func_roots = set(func_queue)
     call_sites: dict[int, CallSite] = {}
     jump_tables: dict[int, JumpTable] = {}
     dynamic_tail_jumps: dict[int, str] = {}
     # `lea reg, [rip + code]` targets: candidate function roots, explored last
-    lea_targets: set[int] = set()
+    lea_targets: set[int] = set(pointer_roots)
     # per-function: map of instruction -> list of intra-procedural successors
     func_succ: dict[int, dict[int, list[int]]] = {}
     func_term: dict[int, dict[int, str]] = {}
@@ -215,7 +218,7 @@ def discover(pe, strict_indirect_jumps: bool = False) -> Program:
                     table = _reaching_lea(d, preds, pt.load, pt.base_reg)
                     if table is None:
                         continue
-                    jt = _table_targets(d, d.insns[jva], table, pt.count, pt.bound_check)
+                    jt = _table_targets(d, d.insns[jva], _with_base(pt.desc, table), pt.count, pt.bound_check)
                     del pending[jva]
                     resolved[jva] = (pt, table)
                     jump_tables[jva] = jt
@@ -317,8 +320,8 @@ def discover(pe, strict_indirect_jumps: bool = False) -> Program:
                     again = None
                 if isinstance(again, PendingTable):
                     t = _reaching_lea(d, preds, again.load, again.base_reg)
-                    again = None if t is None else _table_targets(d, d.insns[jt.jmp], t, again.count,
-                                                                  again.bound_check)
+                    again = None if t is None else _table_targets(d, d.insns[jt.jmp], _with_base(again.desc, t),
+                                                                  again.count, again.bound_check)
                 if again is None or (again.table, again.count) != (jt.table, jt.count):
                     proof = [(jt.jmp, None)]
             for va, expect in proof:
@@ -375,7 +378,8 @@ def discover(pe, strict_indirect_jumps: bool = False) -> Program:
 
     return Program(pe.image_base, entry, dict(sorted(d.insns.items())), functions,
                    sorted(call_sites.values(), key=lambda c: c.address),
-                   sorted(set(pointer_roots)), jump_tables, dynamic_tail_jumps, soft_roots, rejected_roots)
+                   sorted(r for r in set(pointer_roots) if r in functions), jump_tables, dynamic_tail_jumps,
+                   soft_roots, rejected_roots)
 
 
 MAX_JUMP_TABLE_ENTRIES = 4096
@@ -384,7 +388,7 @@ MAX_JUMP_TABLE_ENTRIES = 4096
 _NONVOLATILE = frozenset({3, 5, 6, 7, 12, 13, 14, 15})
 
 
-def _upper_half_zero(d, preds, va, reg_index, limit=4096):
+def _upper_half_zero(d, preds, va, reg_index, limit=4096, sext_ok=False):
     """Prove that bits 32..63 of GPR `reg_index` are zero on entry to `va`:
     on every intra-procedural path backwards, the last instruction writing the
     register must be a plain 32-bit write (which zero-extends). Calls are
@@ -413,6 +417,8 @@ def _upper_half_zero(d, preds, va, reg_index, limit=4096):
                     return False
                 stack.append(p)
                 continue
+            if sext_ok and _sign_extends_32(insn, reg_index):
+                continue          # sign-extension of a value later proven < 2^31 leaves bits 32..63 zero
             if not (all(r.width == 32 for r in w) and not any(make_register(n).high8 for n in insn.regs_written
                                                              if make_register(n).kind == "gpr")):
                 return False
@@ -427,12 +433,26 @@ class PendingTable:
     load: int                      # VA of the `movsxd` that reads the table
     count: int
     bound_check: int
+    desc: tuple = ()               # target descriptor with the base still symbolic
+
+
+def _with_base(desc, table_base):
+    return (desc[0], table_base) + tuple(desc[2:])
 
 
 def _writes_gpr(insn, index):
     from .decoder import make_register
     return [make_register(n) for n in insn.regs_written
             if make_register(n).kind == "gpr" and make_register(n).index == index]
+
+
+def _sign_extends_32(insn, reg_index):
+    """`movsxd r64, r/m32` or `cdqe` writing GPR `reg_index` from a 32-bit value."""
+    ops = insn.operands
+    if insn.mnemonic == "cdqe":
+        return reg_index == 0
+    return (insn.mnemonic == "movsxd" and len(ops) == 2 and ops[0].kind == "reg" and ops[0].reg.width == 64
+            and ops[0].reg.index == reg_index and ops[1].size == 4)
 
 
 def _copy_before(d, preds, va, reg_index, limit=8):
@@ -627,7 +647,9 @@ def _match_jump_table(d, jmp, preds):
         sym[idx_op.reg.index] = ("idx",)
     elif idx_op.reg.width == 32:
         idx32 = idx_op.reg.index           # zero-extension still required
-        if all(_upper_half_zero(d, preds, c.address, idx32) for c in cmps):
+        # unsigned compare: a bound N < 2^31 also proves bit 31 clear, so a
+        # sign-extending writer leaves the 64-bit register equal to the index
+        if all(_upper_half_zero(d, preds, c.address, idx32, sext_ok=count <= 1 << 31) for c in cmps):
             sym[idx32] = ("idx",)          # the full 64-bit register already equals the bounded index
         copies = {_copy_before(d, preds, c.address, idx32) for c in cmps}
         if len(copies) == 1 and None not in copies:
@@ -647,92 +669,150 @@ def _match_jump_table(d, jmp, preds):
             r = make_register(n)
             if r.kind == "gpr":
                 written.add(r.index)
+    def base_of(reg, va):
+        """Symbolic table base held in GPR `reg` at `va`: a known `lea [rip+T]`
+        in the sequence, or (if untouched since the bounds check) a register
+        resolved later by reaching definitions."""
+        b = sym.get(reg.index) if reg is not None and reg.kind == "gpr" and reg.width == 64 else None
+        if b is not None:
+            return b[1] if b[0] == "base" else None
+        if reg is not None and reg.kind == "gpr" and reg.width == 64 and reg.index not in written:
+            nonlocal first_load
+            if first_load is None:
+                first_load = va
+            return ("reg", reg.index)
+        return None
+
+    first_load = None             # where a deferred base register is first read
+
+    def kill(index):
+        nonlocal idx32
+        if index == idx32:
+            idx32 = None
+
     for va in body[:-1]:
         if va == reload_va:
             continue
         insn = d.insns[va]
         ops = regs(insn)
         mn = insn.mnemonic
-        if mn == "movzx" and len(ops) == 2 and idx_small is not None and ops[0].kind == "reg" \
-                and ops[0].reg.kind == "gpr" and ops[0].reg.width == 32 and ops[1].kind == "reg" \
+        dst = ops[0] if ops else None
+        if mn == "movzx" and len(ops) == 2 and idx_small is not None and dst.kind == "reg" \
+                and dst.reg.kind == "gpr" and dst.reg.width == 32 and ops[1].kind == "reg" \
                 and ops[1].reg.kind == "gpr" and not ops[1].reg.high8 \
                 and (ops[1].reg.index, ops[1].reg.width) == idx_small:
-            sym[ops[0].reg.index] = ("idx",)              # zero-extended bounded 8/16-bit index
-            if ops[0].reg.index == idx_small[0]:
+            sym[dst.reg.index] = ("idx",)                 # zero-extended bounded 8/16-bit index
+            if dst.reg.index == idx_small[0]:
                 idx_small = None
-            if ops[0].reg.index == idx32:
-                idx32 = None
-            continue
-        if mn == "mov" and len(ops) == 2 and all(o.kind == "reg" and o.reg.kind == "gpr" for o in ops)                 and ops[0].reg.width == ops[1].reg.width and ops[0].reg.width in (32, 64):
-            dst, src = ops
+            kill(dst.reg.index)
+        elif mn == "cdqe" and (idx32 == 0 or sym.get(0) == ("idx",)) and count <= 1 << 31:
+            sym[0] = ("idx",)                             # 0 <= eax < 2^31: sign-extension is exact
+            kill(0)
+        elif mn == "movsxd" and len(ops) == 2 and dst.kind == "reg" and dst.reg.width == 64 \
+                and ops[1].kind == "reg" and ops[1].reg.width == 32 and count <= 1 << 31 \
+                and (ops[1].reg.index == idx32 or sym.get(ops[1].reg.index) == ("idx",)):
+            sym[dst.reg.index] = ("idx",)
+            kill(dst.reg.index)
+        elif mn == "mov" and len(ops) == 2 and all(o.kind == "reg" and o.reg.kind == "gpr" for o in ops) \
+                and ops[0].reg.width == ops[1].reg.width and ops[0].reg.width in (32, 64):
+            src = ops[1]
             src_sym = sym.get(src.reg.index)
             if dst.reg.width == 32 and idx32 is not None and src.reg.index == idx32:
-                sym[dst.reg.index] = ("idx",)          # 32-bit mov zero-extends the bounded index
+                sym[dst.reg.index] = ("idx",)             # 32-bit mov zero-extends the bounded index
             elif dst.reg.width == 64 and src_sym is not None:
                 sym[dst.reg.index] = src_sym
             else:
                 raise fail(f"unexpected copy at 0x{va:x}")
-            if dst.reg.index == idx32:
-                idx32 = None
-        elif mn == "lea" and len(ops) == 2 and ops[0].kind == "reg" and ops[0].reg.width == 64                 and ops[1].kind == "mem" and ops[1].mem.rip_target is not None:
-            sym[ops[0].reg.index] = ("base", ops[1].mem.rip_target)
-            if ops[0].reg.index == idx32:
-                idx32 = None
-        elif mn == "movsxd" and len(ops) == 2 and ops[0].kind == "reg" and ops[0].reg.width == 64                 and ops[1].kind == "mem" and ops[1].size == 4:
+            kill(dst.reg.index)
+        elif mn == "lea" and len(ops) == 2 and dst.kind == "reg" and dst.reg.width == 64 \
+                and ops[1].kind == "mem" and ops[1].mem.rip_target is not None:
+            sym[dst.reg.index] = ("base", ops[1].mem.rip_target)
+            kill(dst.reg.index)
+        elif mn == "movsxd" and len(ops) == 2 and dst.kind == "reg" and dst.reg.width == 64 \
+                and ops[1].kind == "mem" and ops[1].size == 4:
+            # clang/gcc: int32 offsets relative to the table: target = T + s32[T + 4*idx]
             m = ops[1].mem
-            b = sym.get(m.base.index) if m.base is not None and m.base.kind == "gpr" else None
-            if b is None and m.base is not None and m.base.kind == "gpr" and m.base.width == 64 \
-                    and m.base.index not in written:
-                # base register set before the bounds check: resolved by reaching
-                # definitions over the whole function (see _reaching_lea)
-                b = ("base", ("reg", m.base.index, va))
+            b = base_of(m.base, va)
             i = sym.get(m.index.index) if m.index is not None and m.index.kind == "gpr" else None
-            if not (b and b[0] == "base" and i == ("idx",) and m.scale == 4 and m.disp == 0
+            if not (b is not None and i == ("idx",) and m.scale == 4 and m.disp == 0
                     and m.segment is None and m.index.width == 64):
                 raise fail(f"unexpected table load at 0x{va:x}")
-            sym[ops[0].reg.index] = ("entry", b[1])
-            if ops[0].reg.index == idx32:
-                idx32 = None
+            sym[dst.reg.index] = ("entry", ("rel", b))
+            kill(dst.reg.index)
+        elif mn == "mov" and len(ops) == 2 and dst.kind == "reg" and dst.reg.kind == "gpr" \
+                and dst.reg.width == 32 and ops[1].kind == "mem" and ops[1].size == 4:
+            # MSVC: uint32 RVAs indexed from the image base: target = B + u32[B + disp + 4*idx]
+            m = ops[1].mem
+            b = base_of(m.base, va)
+            i = sym.get(m.index.index) if m.index is not None and m.index.kind == "gpr" else None
+            if not (b is not None and i is not None and i[0] in ("idx", "idx2") and m.scale == 4
+                    and m.segment is None and m.index.width == 64 and m.disp >= 0):
+                raise fail(f"unexpected table load at 0x{va:x}")
+            if i[0] == "idx2" and i[1] != b:
+                raise fail(f"index table and entry table use different bases at 0x{va:x}")
+            sym[dst.reg.index] = ("entry", ("rva", b, m.disp, i[2] if i[0] == "idx2" else None))
+            kill(dst.reg.index)
+        elif mn == "movzx" and len(ops) == 2 and dst.kind == "reg" and dst.reg.kind == "gpr" \
+                and dst.reg.width == 32 and ops[1].kind == "mem" and ops[1].size == 1:
+            # MSVC two-level switch: byte index table u8[B + disp + idx] selects the entry
+            m = ops[1].mem
+            b = base_of(m.base, va)
+            i = sym.get(m.index.index) if m.index is not None and m.index.kind == "gpr" else None
+            if not (b is not None and i == ("idx",) and m.scale == 1 and m.segment is None
+                    and m.index.width == 64 and m.disp >= 0):
+                raise fail(f"unexpected index-table load at 0x{va:x}")
+            sym[dst.reg.index] = ("idx2", b, m.disp)
+            kill(dst.reg.index)
         elif mn == "add" and len(ops) == 2 and all(o.kind == "reg" and o.reg.width == 64 for o in ops):
             a, b = sym.get(ops[0].reg.index), sym.get(ops[1].reg.index)
-            # a deferred base register (set before the bounds check, untouched since)
-            for x, y, other in ((a, b, ops[1]), (b, a, ops[0])):
-                if x and x[0] == "entry" and isinstance(x[1], tuple) and y is None \
-                        and other.reg.index == x[1][1] and other.reg.index not in written:
-                    if x is a:
-                        b = ("base", x[1])
-                    else:
-                        a = ("base", x[1])
-            pair = {a[0] if a else None, b[0] if b else None}
-            if pair != {"entry", "base"} or a[1] != b[1]:
+            ent, other = (a, ops[1]) if a and a[0] == "entry" else (b, ops[0]) if b and b[0] == "entry" else (None, None)
+            if ent is None:
                 raise fail(f"unexpected add at 0x{va:x}")
-            sym[ops[0].reg.index] = ("target", a[1])
+            desc = ent[1]
+            if base_of(other.reg, va) != desc[1]:
+                raise fail(f"unexpected add at 0x{va:x}")
+            sym[ops[0].reg.index] = ("target", desc)
         else:
             raise fail(f"unexpected instruction '{insn.text}' at 0x{va:x}")
 
     final = sym.get(op.reg.index)
     if not final or final[0] != "target":
         raise fail("jump register is not table base + table entry")
-    table = final[1]
-    if isinstance(table, tuple):                       # ("reg", index, load VA): needs reaching definitions
-        return PendingTable(jmp.address, table[1], table[2], count, cmp.address), proof
-    return _table_targets(d, jmp, table, count, cmp.address), proof
+    desc = final[1]
+    if isinstance(desc[1], tuple):                     # ("reg", index): needs reaching definitions
+        return PendingTable(jmp.address, desc[1][1], first_load, count, cmp.address, desc), proof
+    return _table_targets(d, jmp, desc, count, cmp.address), proof
 
 
-def _table_targets(d, jmp, table, count, cmp_va):
+def _table_targets(d, jmp, desc, count, cmp_va):
+    """Read the entries from the image (the translated code re-reads the table
+    at run time and faults on any target not in this set, so a table that is
+    rewritten later cannot redirect control flow). desc = ("rel", T): target = T + s32[T + 4k];
+    ("rva", B, disp, bt): target = B + u32[B + disp + 4j] with j = k, or
+    j = u8[B + bt + k] for a two-level (byte index) table."""
     def fail(why):
         return CFGError(f"0x{jmp.address:x}: unresolved indirect jump '{jmp.text}' ({why})")
-    targets = []
-    for k in range(count):
-        ea = table + 4 * k
+
+    def read(ea, n, signed=False):
         rva = ea - d.base
-        if not (0 <= rva and rva + 4 <= len(d.pe.image)):
-            raise fail(f"table entry {k} outside the image")
-        raw = int.from_bytes(bytes(d.pe.image[rva:rva + 4]), "little", signed=True)
-        t = (table + raw) & ((1 << 64) - 1)
+        if not (0 <= rva and rva + n <= len(d.pe.image)):
+            raise fail(f"table entry at 0x{ea:x} outside the image")
+        return int.from_bytes(bytes(d.pe.image[rva:rva + n]), "little", signed=signed)
+
+    targets = []
+    if desc[0] == "rel":
+        table = desc[1]
+        for k in range(count):
+            targets.append((table + read(table + 4 * k, 4, signed=True)) & ((1 << 64) - 1))
+    else:
+        _, base, disp, bt = desc
+        table = base + disp
+        js = [read(base + bt + k, 1) for k in range(count)] if bt is not None else list(range(count))
+        for j in js:
+            targets.append((base + read(table + 4 * j, 4)) & ((1 << 64) - 1))
+    for t in targets:
         if not d.in_code(t):
-            raise fail(f"table entry {k} -> 0x{t:x} is not in an executable section")
-        targets.append(t)
+            raise fail(f"table entry -> 0x{t:x} is not in an executable section")
     return JumpTable(jmp.address, table, count, tuple(targets), cmp_va)
 
 

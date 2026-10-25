@@ -33,6 +33,17 @@ JT_ZEXT_W64 = ("bb02000000e8370000004883c30183fb037728488d15280000004863049a4801
                "b865000000c3b866000000c3b867000000c3b8e7030000c3c3e1ffffffe7ffffffedfffffff3ffffff")
 JT_ZEXT_H8 = ("bb02000000e835000000b70083fb037728488d15280000004863049a4801d0ffe0b864000000c3b865000000c3"
               "b866000000c3b867000000c3b8e7030000c3c3e1ffffffe7ffffffedfffffff3ffffff")
+# MSVC: `cmp ecx, 3; ja; movsxd rax, ecx; lea rdx, [__ImageBase];
+# mov ecx, [rdx + rax*4 + RVA(tbl)]; add rcx, rdx; jmp rcx` - entries are RVAs.
+JT_MSVC = ("bb02000000e83b00000089d983f903772e4863c1488d15e5efffff8b8c82461000004801d1ffe1b864000000c3"
+           "b865000000c3b866000000c3b867000000c3b8e7030000c3c3271000002d1000003310000039100000")
+# MSVC two-level: byte index table u8[rbx + RVA(idx) + rdi] selects the RVA entry; the image
+# base is loaded into RBX (callee-saved) before a call, i.e. before the bounds check.
+JT_MSVC2 = ("488d1df9efffffbf05000000e83100000083ff0777260fb6843b4f1000008b8c83431000004801d9ffe1b864000000"
+            "c3b865000000c3b866000000c3b8e7030000c3c32a10000030100000361000000000010102020100")
+# Same with the base in R9 (volatile): the call may change it -> no table.
+JT_MSVC2_VOL = ("4c8d0df9efffffbf05000000e83300000083ff077728410fb6843951100000418b8c81451000004c01c9ffe1b864"
+                "000000c3b865000000c3b866000000c3b8e7030000c3c32c10000032100000381000000000010102020100")
 JT_RUNTIME = ("31c9488d15000000004c8d05f0ffffff4929d044890283f900771889c8488d1500000000"
               "486304824801d0ffe0b801000000c3c3")
 
@@ -105,6 +116,21 @@ class JumpTableCFGTests(unittest.TestCase):
             self.assertEqual(prog.jump_tables, {})
             self.assertEqual(len(prog.dynamic_tail_jumps), 1)
 
+    def test_msvc_rva_table(self):
+        (jt,) = discover(JT_MSVC, strict=True).jump_tables.values()
+        self.assertEqual(jt.count, 4)
+        self.assertEqual([t - BASE - TEXT_RVA for t in jt.targets], [0x27, 0x2d, 0x33, 0x39])
+
+    def test_msvc_two_level_table_with_base_set_before_the_check(self):
+        (jt,) = discover(JT_MSVC2, strict=True).jump_tables.values()
+        self.assertEqual(jt.count, 8)                       # entries 0..7 via the byte index table
+        self.assertEqual(sorted({t - BASE - TEXT_RVA for t in jt.targets}), [0x2a, 0x30, 0x36])
+
+    def test_base_in_volatile_register_across_call_is_not_a_table(self):
+        prog = discover(JT_MSVC2_VOL)
+        self.assertEqual(prog.jump_tables, {})
+        self.assertEqual(len(prog.dynamic_tail_jumps), 1)
+
     def test_xm_fixture_table(self):
         from recompiler.cfg import discover as d
         from recompiler.pe import PE
@@ -119,6 +145,10 @@ class JumpTableCFGTests(unittest.TestCase):
 
 @unittest.skipUnless(CC and dec.capstone is not None, "C compiler and capstone required")
 class JumpTableExecutionTests(_SnippetCheck, unittest.TestCase):
+    def test_msvc_tables_execute(self):
+        self.check(JT_MSVC, {"rax": 102, "rbx": 2, "rcx": BASE + TEXT_RVA + 0x33, "rdx": BASE})
+        self.check(JT_MSVC2, {"rax": 102, "rbx": BASE, "rcx": BASE + TEXT_RVA + 0x36, "rdi": 5})   # idx[5] = 2
+
     def test_table_with_zero_extension_proved_earlier(self):
         table = BASE + TEXT_RVA + len(bytes.fromhex(JT_ZEXT_NV)) - 16
         self.check(JT_ZEXT_NV, {"rax": 102, "rbx": 2, "rdx": table})
