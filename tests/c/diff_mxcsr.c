@@ -153,6 +153,57 @@ static void check_cfg(void) {
             CHECK("mulpd.lo", a, b, vr.lo, mv.lo, st.mxcsr & 0x3f);
             CHECK("mulpd.hi", b, vb.hi, vr.hi, mv.hi, st.mxcsr & 0x3f);
         }
+        /* single-precision scalar and packed conversions (x86_sse.h / x86_simd.h wrappers) */
+        {
+            x86_state st; memset(&st, 0, sizeof st);
+            uint64_t i64; uint32_t i32, r32b;
+#define W32(NAME, ASM, CALL) __asm__ volatile(ASM : "=r"(r32b) : "r"(x), "r"(y), "m"(cfg), "m"(mx_after) : "xmm0", "xmm1", "memory"); \
+            st.mxcsr = cfg; m = CALL; CHECK(NAME, x, y, r32b, m, st.mxcsr & 0x3f);
+            W32("maxss", "ldmxcsr %3; movd %1, %%xmm0; movd %2, %%xmm1; maxss %%xmm1, %%xmm0; movd %%xmm0, %0; stmxcsr %4",
+                sse_f32_max(&st, x, y))
+            W32("minss", "ldmxcsr %3; movd %1, %%xmm0; movd %2, %%xmm1; minss %%xmm1, %%xmm0; movd %%xmm0, %0; stmxcsr %4",
+                sse_f32_min(&st, x, y))
+            W32("cmpltss", "ldmxcsr %3; movd %1, %%xmm0; movd %2, %%xmm1; cmpltss %%xmm1, %%xmm0; movd %%xmm0, %0; stmxcsr %4",
+                sse_f32_cmp(&st, x, y, 1))
+            W32("cmpunordss", "ldmxcsr %3; movd %1, %%xmm0; movd %2, %%xmm1; cmpunordss %%xmm1, %%xmm0; movd %%xmm0, %0; stmxcsr %4",
+                sse_f32_cmp(&st, x, y, 3))
+            uint64_t ef;
+            __asm__ volatile("ldmxcsr %3; movd %1, %%xmm0; movd %2, %%xmm1; comiss %%xmm1, %%xmm0; pushfq; popq %0; stmxcsr %4"
+                             : "=r"(ef) : "r"(x), "r"(y), "m"(cfg), "m"(mx_after) : "xmm0", "xmm1", "cc", "memory");
+            st.mxcsr = cfg; sse_f32_comi(&st, x, y);
+            m = (uint64_t)st.cf | ((uint64_t)st.pf << 2) | ((uint64_t)st.zf << 6);
+            CHECK("comiss", x, y, ef & 0x45, m, st.mxcsr & 0x3f);
+            __asm__ volatile("ldmxcsr %3; movd %1, %%xmm0; movd %2, %%xmm1; ucomiss %%xmm1, %%xmm0; pushfq; popq %0; stmxcsr %4"
+                             : "=r"(ef) : "r"(x), "r"(y), "m"(cfg), "m"(mx_after) : "xmm0", "xmm1", "cc", "memory");
+            st.mxcsr = cfg; sse_f32_ucomi(&st, x, y);
+            m = (uint64_t)st.cf | ((uint64_t)st.pf << 2) | ((uint64_t)st.zf << 6);
+            CHECK("ucomiss", x, y, ef & 0x45, m, st.mxcsr & 0x3f);
+            __asm__ volatile("ldmxcsr %2; movd %1, %%xmm0; cvttss2si %%xmm0, %0; stmxcsr %3"
+                             : "=r"(i64) : "r"(x), "m"(cfg), "m"(mx_after) : "xmm0", "memory");
+            st.mxcsr = cfg; m = sse_cvttss2si(&st, x, 64); CHECK("cvttss2si64", x, 0, i64, m, st.mxcsr & 0x3f);
+            __asm__ volatile("ldmxcsr %2; movd %1, %%xmm0; cvtss2si %%xmm0, %k0; stmxcsr %3"
+                             : "=r"(i32) : "r"(x), "m"(cfg), "m"(mx_after) : "xmm0", "memory");
+            st.mxcsr = cfg; m = sse_cvtss2si(&st, x, 32); CHECK("cvtss2si32", x, 0, i32, m, st.mxcsr & 0x3f);
+            /* packed conversions on (x, y, a.lo, a.hi) lanes */
+            v128 vin = { (uint64_t)x | ((uint64_t)y << 32), a }, vout;
+            uint64_t ib = b;
+            if ((k & 3) == 1) vin.lo = (uint64_t)(uint32_t)rnd() | (rnd() << 32);   /* raw int32 lanes */
+#define PK(NAME, INSN, CALL) __asm__ volatile("ldmxcsr %2; movdqu %1, %%xmm1; " INSN " %%xmm1, %%xmm0; movdqu %%xmm0, %0; stmxcsr %3" \
+                : "=m"(vout) : "m"(vin), "m"(cfg), "m"(mx_after) : "xmm0", "xmm1", "memory"); \
+            st.mxcsr = cfg; { v128 mv = CALL; CHECK(NAME ".lo", vin.lo, vin.hi, vout.lo, mv.lo, st.mxcsr & 0x3f); \
+                              CHECK(NAME ".hi", vin.lo, vin.hi, vout.hi, mv.hi, st.mxcsr & 0x3f); }
+            PK("cvtdq2ps", "cvtdq2ps", v_cvtdq2ps(&st, vin))
+            PK("cvtdq2pd", "cvtdq2pd", v_cvtdq2pd(&st, vin.lo))
+            PK("cvtps2pd", "cvtps2pd", v_cvtps2pd(&st, vin.lo))
+            PK("cvtps2dq", "cvtps2dq", v_cvtps2dq(&st, vin, 0))
+            PK("cvttps2dq", "cvttps2dq", v_cvtps2dq(&st, vin, 1))
+            vin.lo = a; vin.hi = ib;                                          /* two doubles */
+            PK("cvtpd2ps", "cvtpd2ps", v_cvtpd2ps(&st, vin))
+            PK("cvtpd2dq", "cvtpd2dq", v_cvtpd2dq(&st, vin, 0))
+            PK("cvttpd2dq", "cvttpd2dq", v_cvtpd2dq(&st, vin, 1))
+#undef PK
+#undef W32
+        }
         __asm__ volatile("ldmxcsr %2; movd %k1, %%xmm1; cvtss2sd %%xmm1, %%xmm0; movq %%xmm0, %0; stmxcsr %3"
                          : "=r"(r) : "r"(x), "m"(cfg), "m"(mx_after) : "xmm0", "xmm1", "memory");
         fl = 0; m = sf_f32_to_f64(&env, x, &fl); CHECK("cvtss2sd", x, 0, r, m, fl);

@@ -134,6 +134,8 @@ static inline uint64_t sse_minmax(x86_state *s, const sf_fmt *f, uint64_t a, uin
     if (e.daz && chosen.denormal) return sf_zero(f, chosen.sign);
     return pick;
 }
+static inline uint32_t sse_f32_max(x86_state *s, uint32_t a, uint32_t b) { return (uint32_t)sse_minmax(s, &SF_F32, a, b, 1); }
+static inline uint32_t sse_f32_min(x86_state *s, uint32_t a, uint32_t b) { return (uint32_t)sse_minmax(s, &SF_F32, a, b, 0); }
 static inline uint64_t sse_f64_max(x86_state *s, uint64_t a, uint64_t b) { return sse_minmax(s, &SF_F64, a, b, 1); }
 static inline uint64_t sse_f64_min(x86_state *s, uint64_t a, uint64_t b) { return sse_minmax(s, &SF_F64, a, b, 0); }
 
@@ -149,11 +151,37 @@ static inline void sse_ucomi(x86_state *s, const sf_fmt *f, uint64_t a, uint64_t
     s->pf = c == 2;
     s->cf = c < 0 || c == 2;
 }
+static inline void sse_f32_ucomi(x86_state *s, uint32_t a, uint32_t b) { sse_ucomi(s, &SF_F32, a, b, 0); }
+static inline void sse_f32_comi(x86_state *s, uint32_t a, uint32_t b) { sse_ucomi(s, &SF_F32, a, b, 1); }
 static inline void sse_f64_ucomi(x86_state *s, uint64_t a, uint64_t b) { sse_ucomi(s, &SF_F64, a, b, 0); }
 static inline void sse_f64_comi(x86_state *s, uint64_t a, uint64_t b) { sse_ucomi(s, &SF_F64, a, b, 1); }
 
 /* CMPSD predicate imm8[2:0]: EQ LT LE UNORD NEQ NLT NLE ORD -> all-ones/zeros mask.
  * LT/LE/NLT/NLE signal IE on any NaN; the others only on SNaN. */
+static inline int sse_cmp_pred(int c, unsigned p);
+static inline uint64_t sse_cmp_fmt(x86_state *s, const sf_fmt *f, uint64_t a, uint64_t b, unsigned pred) {
+    sf_env e = sse_env(s);
+    sf_num x = sf_unpack(f, a, &e), y = sf_unpack(f, b, &e);
+    unsigned p = pred & 7;
+    sse_flags(s, sse_cmp_flags(&e, &x, &y, p == 1 || p == 2 || p == 5 || p == 6));
+    return sse_cmp_pred(sf_compare(f, &x, &y), p) ? (f == &SF_F64 ? ~(uint64_t)0 : 0xffffffffu) : 0;
+}
+static inline uint32_t sse_f32_cmp(x86_state *s, uint32_t a, uint32_t b, unsigned pred) {
+    return (uint32_t)sse_cmp_fmt(s, &SF_F32, a, b, pred);
+}
+static inline int sse_cmp_pred(int c, unsigned p) {
+    int un = c == 2;
+    switch (p & 7) {
+    case 0: return c == 0;
+    case 1: return !un && c < 0;
+    case 2: return !un && c <= 0;
+    case 3: return un;
+    case 4: return c != 0;
+    case 5: return un || c >= 0;
+    case 6: return un || c > 0;
+    default: return !un;
+    }
+}
 static inline uint64_t sse_f64_cmp(x86_state *s, uint64_t a, uint64_t b, unsigned pred) {
     sf_env e = sse_env(s);
     sf_num x = sf_unpack(&SF_F64, a, &e), y = sf_unpack(&SF_F64, b, &e);
@@ -182,6 +210,8 @@ static inline uint64_t sse_to_int(x86_state *s, const sf_fmt *f, uint64_t b, uns
 }
 static inline uint64_t sse_cvttsd2si(x86_state *s, uint64_t b, unsigned bits) { return sse_to_int(s, &SF_F64, b, bits, 1); }
 static inline uint64_t sse_cvtsd2si(x86_state *s, uint64_t b, unsigned bits) { return sse_to_int(s, &SF_F64, b, bits, 0); }
+static inline uint64_t sse_cvttss2si(x86_state *s, uint32_t b, unsigned bits) { return sse_to_int(s, &SF_F32, b, bits, 1); }
+static inline uint64_t sse_cvtss2si(x86_state *s, uint32_t b, unsigned bits) { return sse_to_int(s, &SF_F32, b, bits, 0); }
 static inline uint64_t sse_cvtsi2sd(x86_state *s, uint64_t v, unsigned bits) {
     sf_env e = sse_env(s); unsigned fl = 0;
     uint64_t r = sf_from_int(&SF_F64, &e, (int64_t)x86_sext(v, bits), &fl);

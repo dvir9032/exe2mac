@@ -98,6 +98,19 @@ SSE_MNEMONICS = (set(SSE_ARITH_SD) | set(SSE_ARITH_SS) | SSE_MOV128_ALIGNED | SS
                  | set(SIMD_BYTESHIFT) | set(SIMD_SHUF_IMM) | set(SIMD_MOVMSK) | {"cvtsi2ss"}
                  | {"movsd", "movss", "movd", "movq", "sqrtsd", "minsd", "maxsd", "ucomisd", "comisd",
                     "cmpsd", "cvtsd2ss", "cvtss2sd", "cvtsi2sd", "cvttsd2si", "cvtsd2si"})
+SSE_CMP_SS = {k.replace("sd", "ss"): v for k, v in SSE_CMP_SD.items()}
+# packed conversions: mnemonic -> (helper expression on `a`, source kind)
+#   "m128": xmm/m128 (aligned), "m64": xmm low qword or m64
+SSE_PACKED_CVT = {"cvtdq2ps": ("v_cvtdq2ps(s, a)", "m128"), "cvtpd2ps": ("v_cvtpd2ps(s, a)", "m128"),
+                  "cvtps2dq": ("v_cvtps2dq(s, a, 0)", "m128"), "cvttps2dq": ("v_cvtps2dq(s, a, 1)", "m128"),
+                  "cvtpd2dq": ("v_cvtpd2dq(s, a, 0)", "m128"), "cvttpd2dq": ("v_cvtpd2dq(s, a, 1)", "m128"),
+                  "cvtdq2pd": ("v_cvtdq2pd(s, a.lo)", "m64"), "cvtps2pd": ("v_cvtps2pd(s, a.lo)", "m64")}
+SSE_NT_STORES = {"movntps", "movntpd", "movntdq"}        # non-temporal hint only: an aligned store
+SSE_MNEMONICS |= (set(SSE_CMP_SS) | set(SSE_PACKED_CVT) | SSE_NT_STORES
+                  | {"maxss", "minss", "ucomiss", "comiss", "sqrtss", "cvttss2si", "cvtss2si", "cmpss"})
+# no architectural effect for one guest thread (cache hints and memory-ordering fences)
+NO_EFFECT = {"prefetchnta", "prefetcht0", "prefetcht1", "prefetcht2", "prefetchw", "sfence", "lfence", "mfence",
+             "pause"}
 CMPOPS = {"cmp": "x86_sub", "test": "x86_and"}
 UNOPS = {"inc": "x86_inc", "dec": "x86_dec", "neg": "x86_neg"}
 
@@ -270,6 +283,8 @@ class Lifter:
             f.locked = True
         if mn == "nop":                     # multi-byte NOPs never access their memory operand
             return [f"/* 0x{insn.address:x}: nop */"]
+        if mn in NO_EFFECT:                 # prefetch never faults; fences order memory for other agents only
+            return [f"/* 0x{insn.address:x}: {insn.text}: no effect for a single guest thread */"]
         f.check_prefixes()
         ops = insn.operands
         f.emit(f"/* 0x{insn.address:x}: {insn.text} */")
@@ -741,6 +756,46 @@ class Lifter:
             if src.kind not in ("reg", "mem") or src.size not in (4, 8) or (src.kind == "reg" and src.reg.kind != "gpr"):
                 raise _err(insn, "cvtsi2sd source must be r/m32 or r/m64")
             f.emit(f"xmm_set_lo64(s, {xmm(dst)}, sse_cvtsi2sd(s, {f.read(src)}, {src.bits}));")
+        elif mn in ("minss", "maxss"):
+            dst, src = f.need(2)
+            d = xmm(dst)
+            f.emit(f"xmm_set_lo32(s, {d}, sse_f32_{mn[:3]}(s, (uint32_t)s->xmm[{d}].lo, {src32(src)}));")
+        elif mn == "sqrtss":
+            dst, src = f.need(2)
+            f.emit(f"xmm_set_lo32(s, {xmm(dst)}, sse_f32_sqrt(s, {src32(src)}));")
+        elif mn in ("ucomiss", "comiss"):
+            a, b = f.need(2)
+            f.emit(f"sse_f32_{'ucomi' if mn == 'ucomiss' else 'comi'}(s, (uint32_t)s->xmm[{xmm(a)}].lo, {src32(b)});")
+        elif mn in SSE_CMP_SS or mn == "cmpss":
+            if mn == "cmpss":
+                dst, src, imm = f.need(3)
+                if imm.kind != "imm" or imm.imm > 7:
+                    raise _err(insn, "cmpss predicate must be 0..7")
+                pred = imm.imm
+            else:
+                dst, src = f.need(2)
+                pred = SSE_CMP_SS[mn]
+            d = xmm(dst)
+            f.emit(f"xmm_set_lo32(s, {d}, sse_f32_cmp(s, (uint32_t)s->xmm[{d}].lo, {src32(src)}, {pred}u));")
+        elif mn in ("cvttss2si", "cvtss2si"):
+            dst, src = f.need(2)
+            if dst.kind != "reg" or dst.reg.kind != "gpr" or dst.reg.width not in (32, 64):
+                raise _err(insn, f"{mn} destination must be r32 or r64")
+            f.emit(f.write(dst, f"sse_{mn}(s, {src32(src)}, {dst.reg.width})"))
+        elif mn in SSE_PACKED_CVT:
+            dst, src = f.need(2)
+            expr, kind = SSE_PACKED_CVT[mn]
+            if kind == "m128":
+                src128(src, True)
+            else:
+                f.emit(f"{{ uint64_t lo = {src64(src)}, hi = 0;")
+            f.emit(f"  v128 a = {{ lo, hi }}; (void)a.hi;")
+            f.emit(f"  v_set_xmm(s, {xmm(dst)}, {expr}); }}")
+        elif mn in SSE_NT_STORES:
+            dst, src = f.need(2)
+            if dst.kind != "mem" or dst.size != 16:
+                raise _err(insn, f"invalid {mn} form")
+            f.emit(f"x86_st128(s, {xmm(src)}, {f.ea(dst)}, 1);")
         elif mn in ("cvttsd2si", "cvtsd2si"):
             dst, src = f.need(2)
             if dst.kind != "reg" or dst.reg.kind != "gpr" or dst.reg.width not in (32, 64):

@@ -188,4 +188,53 @@ static inline v128 v_fp64(x86_state *s, v128 a, v128 b, int op) {
     return r;
 }
 
+/* ---- packed conversions (flags of all lanes accumulate, recorded once) ---- */
+/* CVTDQ2PS: 4 x int32 -> float, rounded per MXCSR.RC (PE) */
+static inline v128 v_cvtdq2ps(x86_state *s, v128 a) {
+    sf_env e = sse_env(s); unsigned fl = 0; v128 r = { 0, 0 };
+    for (unsigned i = 0; i < 4; i++)
+        r = v_put(r, 32, i, sf_from_int(&SF_F32, &e, v_sext(v_get(a, 32, i), 32), &fl));
+    sse_flags(s, fl);
+    return r;
+}
+/* CVTDQ2PD: low 2 x int32 -> double (always exact) */
+static inline v128 v_cvtdq2pd(x86_state *s, uint64_t lo) {
+    sf_env e = sse_env(s); unsigned fl = 0;
+    v128 r = { sf_from_int(&SF_F64, &e, v_sext(lo & 0xffffffffu, 32), &fl),
+               sf_from_int(&SF_F64, &e, v_sext(lo >> 32, 32), &fl) };
+    sse_flags(s, fl);
+    return r;
+}
+/* CVTPS2PD: low 2 x float -> double (IE for SNaN, DE for denormals unless DAZ) */
+static inline v128 v_cvtps2pd(x86_state *s, uint64_t lo) {
+    sf_env e = sse_env(s); unsigned fl = 0;
+    v128 r = { sf_f32_to_f64(&e, (uint32_t)lo, &fl), sf_f32_to_f64(&e, (uint32_t)(lo >> 32), &fl) };
+    sse_flags(s, fl);
+    return r;
+}
+/* CVTPD2PS: 2 x double -> 2 x float in the low qword; the high qword is zeroed */
+static inline v128 v_cvtpd2ps(x86_state *s, v128 a) {
+    sf_env e = sse_env(s); unsigned fl = 0;
+    uint64_t x = sf_f64_to_f32(&e, a.lo, &fl), y = sf_f64_to_f32(&e, a.hi, &fl);
+    sse_flags(s, fl);
+    v128 r = { x | (y << 32), 0 };
+    return r;
+}
+/* CVT(T)PS2DQ: 4 x float -> int32 (indefinite 0x80000000 + IE when out of range / NaN) */
+static inline v128 v_cvtps2dq(x86_state *s, v128 a, int truncate) {
+    sf_env e = sse_env(s); unsigned fl = 0; v128 r = { 0, 0 };
+    for (unsigned i = 0; i < 4; i++)
+        r = v_put(r, 32, i, sf_to_int(&SF_F32, &e, v_get(a, 32, i), 32, truncate, &fl));
+    sse_flags(s, fl);
+    return r;
+}
+/* CVT(T)PD2DQ: 2 x double -> 2 x int32 in the low qword; the high qword is zeroed */
+static inline v128 v_cvtpd2dq(x86_state *s, v128 a, int truncate) {
+    sf_env e = sse_env(s); unsigned fl = 0;
+    uint64_t x = sf_to_int(&SF_F64, &e, a.lo, 32, truncate, &fl), y = sf_to_int(&SF_F64, &e, a.hi, 32, truncate, &fl);
+    sse_flags(s, fl);
+    v128 r = { (x & 0xffffffffu) | (y << 32), 0 };
+    return r;
+}
+
 #endif

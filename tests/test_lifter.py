@@ -334,7 +334,7 @@ class FailClosedLifterTests(unittest.TestCase):
         self.assertIn(b"no translated code", r.stderr)
 
     def test_unsupported_sse(self):
-        self.assertRejected("f30f2dc0c3", "register xmm0 is not supported")      # cvtss2si (not implemented)
+        self.assertRejected("0f53c1c3", "register xmm0 is not supported")        # rcpps (approximation: CPU-specific)
         self.assertRejected("660ff5c1c3", "register xmm0 is not supported")      # pmaddwd (not implemented)
         self.assertRejected("0fae00c3", "unsupported instruction.*fxsave")       # fxsave [rax] (x87/SSE state save)
 
@@ -455,3 +455,10 @@ class Wave3SnippetTests(_SnippetCheck, unittest.TestCase):
                 "490fca49c7c3300000004d0fbddb4883ec104889e7b8efbeaddeb904000000f3ab4c8b642408488d642410c3")
         self.check(code, {"rax": 0xdeadbeef, "rdx": 1, "r8": 1, "r9": 0x30, "r10": 0x0807060504030201,
                           "r11": 5, "r12": 0xdeadbeefdeadbeef, "rdi": RSP0})
+
+    def test_single_precision_and_packed_conversion_forms(self):
+        # mov eax,3; movd xmm0,eax; cvtdq2ps xmm1,xmm0; cvttss2si ecx,xmm1; comiss xmm1,xmm1;
+        # prefetchnta [rsp]; movd edx,xmm1; ret
+        self.check("b803000000660f6ec00f5bc8f30f2cc90f2fc90f180424660f7ecac3",
+                   {"rax": 3, "rcx": 3, "rdx": 0x40400000},
+                   {"cf": 0, "pf": 0, "af": 0, "zf": 1, "sf": 0, "of": 0})
