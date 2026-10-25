@@ -105,3 +105,25 @@ jobs:
             build/
             dist/Hello.dmg
             dist/smoke.*
+
+  # Reference run of the ORIGINAL hello.exe on Windows: confirms that the
+  # source-derived golden file matches what real Windows produces.
+  windows-reference:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the original hello.exe and compare with the golden file
+        run: |
+          set +e
+          ./test/hello.exe > win.stdout 2> win.stderr
+          code=$?
+          set -e
+          same=MISMATCH; cmp -s win.stdout test/golden/hello.stdout && same=MATCH
+          ver="$(cmd.exe /c ver | tr -d '\r' | tr -s '\n' ' ')"
+          echo "::notice title=windows-reference::host=$ver $(uname -m) | exit=$code | stdout=$same | bytes=$(wc -c < win.stdout | tr -d ' ') | sha256=$(sha256sum < win.stdout | cut -c1-16) | stderr_bytes=$(wc -c < win.stderr | tr -d ' ')"
+          od -c win.stdout | head -20
+          [ "$code" -eq 7 ] && [ "$same" = MATCH ]
