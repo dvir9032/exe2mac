@@ -58,6 +58,27 @@ jobs:
           echo "--- stdout (hex):"; xxd build/hello.stdout || true
           echo "--- stderr:"; cat build/hello.stderr || true
 
+      - name: Package .app and .dmg, then smoke-test from the mounted image
+        id: package
+        run: |
+          set -euo pipefail
+          python3 -m recompiler doctor
+          python3 -m recompiler package test/hello.exe -o dist --name Hello
+          codesign --verify --deep --strict --verbose=2 dist/Hello.app
+          codesign -dv dist/Hello.app 2>&1 | grep -E "Signature|Identifier|Format"
+          hdiutil imageinfo dist/Hello.dmg | grep -E "^Format:"
+          mnt="$(mktemp -d)"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" dist/Hello.dmg
+          trap 'hdiutil detach "$mnt" || true' EXIT
+          ls -la "$mnt"
+          set +e
+          EXE2MAC_DIRECT=1 "$mnt/Hello.app/Contents/MacOS/hello" > dist/smoke.stdout 2> dist/smoke.stderr
+          code=$?
+          set -e
+          same=MISMATCH; cmp -s dist/smoke.stdout test/golden/hello.stdout && same=MATCH
+          echo "smoke: exit=$code stdout=$same stderr_bytes=$(wc -c < dist/smoke.stderr | tr -d ' ')" | tee dist/smoke.txt
+          [ "$code" -eq 7 ] && [ "$same" = MATCH ] && [ ! -s dist/smoke.stderr ]
+
       - name: Publish key results as annotations
         if: always()
         run: |
@@ -68,6 +89,7 @@ jobs:
           note stdout-sha256 "translated=$(shasum -a 256 < build/hello.stdout | cut -c1-16) golden=$(shasum -a 256 < test/golden/hello.stdout | cut -c1-16) bytes=$(wc -c < build/hello.stdout | tr -d ' ')"
           note tests "$(grep -E '^Ran [0-9]+ tests' verify.log | tail -1) -> $(grep -E '^(OK|FAILED)' verify.log | tail -1)"
           grep -E '\.\.\. skipped' verify.log | head -10 | while IFS= read -r l; do note skipped "$l"; done || true
+          note package-smoke "$(cat dist/smoke.txt 2>/dev/null || echo 'not run') | dmg=$(ls -l dist/Hello.dmg 2>/dev/null | awk '{print $5}') bytes | $(codesign -dv dist/Hello.app 2>&1 | grep -E '^Signature=' || echo 'unsigned')"
 
       - name: Upload results
         if: always()
@@ -77,3 +99,5 @@ jobs:
           path: |
             verify.log
             build/
+            dist/Hello.dmg
+            dist/smoke.*

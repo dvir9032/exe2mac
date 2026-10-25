@@ -3,6 +3,8 @@
     python3 -m recompiler translate test/hello.exe -o build/hello.gen.c
     python3 -m recompiler build     test/hello.exe -o build/hello
     python3 -m recompiler run       test/hello.exe [--expect-stdout FILE] [--expect-exit N]
+    python3 -m recompiler package   test/hello.exe -o dist [--name Hello] [--no-dmg] [--no-sign]
+    python3 -m recompiler doctor
 """
 import argparse
 import os
@@ -30,11 +32,34 @@ def main(argv=None):
     r.add_argument("--cc")
     r.add_argument("--expect-stdout", help="file whose bytes stdout must equal")
     r.add_argument("--expect-exit", type=int)
+    k = sub.add_parser("package", help="build, wrap in a macOS .app, sign ad-hoc and make a .dmg (macOS)")
+    k.add_argument("exe")
+    k.add_argument("-o", "--output", required=True, help="output directory")
+    k.add_argument("--name")
+    k.add_argument("--no-dmg", action="store_true")
+    k.add_argument("--no-sign", action="store_true")
+    k.add_argument("--cc")
+    sub.add_parser("doctor", help="check prerequisites")
     args = p.parse_args(argv)
 
     try:
         if args.cmd == "translate":
             Path(args.output).write_text(translate(args.exe))
+            return 0
+        if args.cmd == "doctor":
+            from .package import doctor
+            ok = True
+            for name, good, detail in doctor():
+                print(f"[{'ok' if good else 'MISSING'}] {name}: {detail}")
+                ok &= good or name.startswith("host is")
+            return 0 if ok else 1
+        if args.cmd == "package":
+            from .package import package
+            res = package(args.exe, args.output, app_name=args.name, dmg=not args.no_dmg,
+                          sign=not args.no_sign, cc=args.cc)
+            print(f"app:    {res['app']}")
+            print(f"signed: {res['signed']} (ad-hoc)")
+            print(f"dmg:    {res['dmg'] or 'not created (needs macOS hdiutil or --no-dmg given)'}")
             return 0
         if args.cmd == "build":
             out = build(args.exe, args.output, cc=args.cc)
