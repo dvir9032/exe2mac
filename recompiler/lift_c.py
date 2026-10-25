@@ -939,6 +939,8 @@ class Lifter:
         L += self.emit_image()
         L.append("")
         bodies, skipped = {}, {}
+        # a direct call proves that its target is code: such a function must lift
+        called = {c.target for c in self.prog.call_sites if c.kind == "direct"}
         for entry in sorted(self.functions):
             try:
                 bodies[entry] = self.lift_function(self.functions[entry])
@@ -946,7 +948,7 @@ class Lifter:
                 # A candidate root found only through `lea [rip + code]` may be data
                 # or unsupported code that is never executed: leave it out of the
                 # dispatcher, so calling it faults. Every other function must lift.
-                if entry not in self.prog.soft_roots:
+                if entry not in self.prog.soft_roots or entry in called:
                     raise
                 skipped[entry] = str(exc)
         for entry, why in sorted(skipped.items()):

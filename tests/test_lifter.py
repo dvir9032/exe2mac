@@ -333,6 +333,12 @@ class FailClosedLifterTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0x01)
         self.assertIn(b"no translated code", r.stderr)
 
+    def test_directly_called_candidate_must_translate(self):
+        # lea rax, [rip + 5] ; call rax ; call f ; ret ; f: pcmpistri xmm0, xmm1, 0xc ; ret
+        # f is a lea candidate AND a direct call target: leaving it out would leave a dangling call
+        code = "488d0508000000" "ffd0" "e801000000" "c3" "660f3a63c10c" "c3"
+        self.assertRejected(code, "pcmpistri")
+
     def test_unsupported_sse(self):
         self.assertRejected("0f53c1c3", "register xmm0 is not supported")        # rcpps (approximation: CPU-specific)
         self.assertRejected("660ff5c1c3", "register xmm0 is not supported")      # pmaddwd (not implemented)
