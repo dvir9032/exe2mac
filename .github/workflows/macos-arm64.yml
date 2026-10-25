@@ -1,0 +1,68 @@
+# Build test/hello.exe into a native macOS ARM64 executable on an
+# Apple-silicon GitHub runner, execute it, and verify stdout + exit code.
+name: macos-arm64
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify-macos-arm64:
+    runs-on: macos-14          # Apple silicon (arm64)
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Host information
+        run: |
+          uname -a
+          sw_vers
+          sysctl -n machdep.cpu.brand_string
+          cc --version
+          python3 --version
+
+      - name: Install dependencies
+        run: |
+          python3 -m pip install capstone==5.0.3
+          python3 -c "import capstone; print('capstone', capstone.__version__)"
+          # GNU objdump is only needed by the legacy objdump-frontend tests;
+          # the translator itself uses Capstone.
+          brew install binutils
+          BU="$(brew --prefix binutils)/bin"
+          if "$BU/objdump" -i 2>/dev/null | grep -q pei-x86-64; then
+            echo "$BU" >> "$GITHUB_PATH"
+            echo "GNU objdump with pei-x86-64 support: $BU/objdump"
+          else
+            echo "::warning::Homebrew binutils lacks pei-x86-64; legacy objdump tests will be skipped"
+          fi
+
+      - name: Build, run and verify hello.exe (stdout byte-for-byte, exit code 7, full test suite)
+        run: |
+          set -o pipefail
+          sh scripts/verify_macos_arm64.sh 2>&1 | tee verify.log
+
+      - name: Inspect the native executable
+        if: always()
+        run: |
+          file build/hello || true
+          lipo -archs build/hello || true
+          otool -L build/hello || true
+          echo "--- stdout (hex):"; xxd build/hello.stdout || true
+          echo "--- stderr:"; cat build/hello.stderr || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64-results
+          path: |
+            verify.log
+            build/

@@ -1,0 +1,429 @@
+"""Lift reachable x86-64 code to C that runs against runtime/x86_cpu.h.
+
+Design (cf. N64Recomp's one-C-function-per-guest-function model, adapted to
+x86-64 and Windows x64):
+
+* every discovered guest function becomes ``static void f_<VA>(x86_state *s)``;
+  its basic blocks become labels and gotos inside that function;
+* guest CALL pushes the guest return VA on the *guest* stack, invokes the
+  callee's C function, then verifies that the callee's guest RET popped exactly
+  that VA (``s->rip``). Host return addresses never enter guest memory;
+* indirect calls (registers, function-pointer tables, IAT slots) load the
+  target VA from guest state/memory at run time and go through the generated
+  ``exe2mac_dispatch`` switch; unknown targets fault;
+* RIP-relative addresses are emitted as ``B + rva`` where ``B`` is the actual
+  load base, so the code stays correct when the image is rebased;
+* every instruction form is matched explicitly. Anything else raises
+  ``TranslationError`` naming the address and instruction - never a no-op.
+"""
+from __future__ import annotations
+
+from .cfg import Program, discover
+from .decoder import Instruction, Operand
+
+M64 = (1 << 64) - 1
+
+SUPPORTED_IMPORTS = frozenset({
+    ("kernel32.dll", "ExitProcess"),
+    ("kernel32.dll", "GetStdHandle"),
+    ("kernel32.dll", "WriteFile"),
+})
+
+COND = {"o": 0, "no": 1, "b": 2, "ae": 3, "e": 4, "ne": 5, "be": 6, "a": 7,
+        "s": 8, "ns": 9, "p": 10, "np": 11, "l": 12, "ge": 13, "le": 14, "g": 15}
+COND_NAMES = ["X86_CC_O", "X86_CC_NO", "X86_CC_B", "X86_CC_AE", "X86_CC_E", "X86_CC_NE",
+              "X86_CC_BE", "X86_CC_A", "X86_CC_S", "X86_CC_NS", "X86_CC_P", "X86_CC_NP",
+              "X86_CC_L", "X86_CC_GE", "X86_CC_LE", "X86_CC_G"]
+
+BINOPS = {"add": "x86_add", "sub": "x86_sub", "and": "x86_and", "or": "x86_or", "xor": "x86_xor"}
+CMPOPS = {"cmp": "x86_sub", "test": "x86_and"}
+UNOPS = {"inc": "x86_inc", "dec": "x86_dec", "neg": "x86_neg"}
+
+
+class TranslationError(RuntimeError):
+    pass
+
+
+def _err(insn: Instruction, why: str) -> TranslationError:
+    return TranslationError(f"0x{insn.address:x}: {why}: '{insn.text}' (bytes {insn.encoding.hex()})")
+
+
+class _Fn:
+    """Per-instruction emission context."""
+
+    def __init__(self, lifter, insn: Instruction):
+        self.l = lifter
+        self.insn = insn
+        self.lines: list[str] = []
+
+    # ---- operands ----------------------------------------------------------
+    def check_prefixes(self):
+        p = self.insn.prefixes
+        if any(x in (0xF0, 0xF2, 0xF3) for x in p):
+            raise _err(self.insn, "LOCK/REP prefixes are not supported")
+        if 0x67 in p:
+            raise _err(self.insn, "32-bit address-size override is not supported")
+        for op in self.insn.operands:
+            if op.kind == "mem" and op.mem.segment is not None:
+                raise _err(self.insn, f"segment override {op.mem.segment.name} is not supported")
+            if op.kind == "reg" and op.reg.kind != "gpr":
+                raise _err(self.insn, f"register {op.reg.name} is not supported")
+
+    def ea(self, op: Operand) -> str:
+        m = op.mem
+        parts = []
+        if m.base is not None:
+            if m.base.kind == "rip":
+                rva = m.rip_target - self.l.pref_base
+                if not 0 <= rva < self.l.image_size:
+                    raise _err(self.insn, "RIP-relative target outside the image")
+                return f"(B + 0x{rva:x}ull)"
+            if m.base.kind != "gpr" or m.base.width != 64:
+                raise _err(self.insn, "non-64-bit base register")
+            parts.append(f"s->gpr[{m.base.index}]")
+        if m.index is not None:
+            if m.index.kind != "gpr" or m.index.width != 64:
+                raise _err(self.insn, "non-64-bit index register")
+            if m.scale not in (1, 2, 4, 8):
+                raise _err(self.insn, "invalid scale")
+            parts.append(f"s->gpr[{m.index.index}]" + (f" * {m.scale}u" if m.scale != 1 else ""))
+        if m.disp or not parts:
+            if not parts:
+                raise _err(self.insn, "absolute (no base/index) memory operand is not supported")
+            parts.append(f"0x{m.disp & M64:x}ull")
+        return "(" + " + ".join(parts) + ")"
+
+    def read(self, op: Operand, ea_var: str | None = None) -> str:
+        if op.kind == "imm":
+            return f"0x{op.imm:x}ull"
+        if op.kind == "reg":
+            r = op.reg
+            if r.width != op.bits:
+                raise _err(self.insn, "register/operand width mismatch")
+            return f"x86_get(s, {r.index}, {r.width}, {int(r.high8)})"
+        if op.size not in (1, 2, 4, 8):
+            raise _err(self.insn, f"memory operand size {op.size}")
+        return f"guest_ld{op.bits}(s->mem, {ea_var or self.ea(op)})"
+
+    def write(self, op: Operand, value: str, ea_var: str | None = None) -> str:
+        if op.kind == "reg":
+            r = op.reg
+            if r.width != op.bits:
+                raise _err(self.insn, "register/operand width mismatch")
+            return f"x86_set(s, {r.index}, {r.width}, {int(r.high8)}, {value});"
+        if op.kind == "mem":
+            if op.size not in (1, 2, 4, 8):
+                raise _err(self.insn, f"memory operand size {op.size}")
+            return f"guest_st{op.bits}(s->mem, {ea_var or self.ea(op)}, {value});"
+        raise _err(self.insn, "cannot write to an immediate")
+
+    def need(self, n):
+        if len(self.insn.operands) != n:
+            raise _err(self.insn, f"expected {n} operands")
+        return self.insn.operands
+
+    def emit(self, line: str):
+        self.lines.append(line)
+
+
+class Lifter:
+    def __init__(self, pe, program: Program):
+        self.pe = pe
+        self.prog = program
+        self.pref_base = pe.image_base
+        self.image_size = pe.size_of_image
+        self.functions = program.functions
+        self.out: list[str] = []
+
+    # ---- helpers -----------------------------------------------------------
+    def rva(self, va: int) -> int:
+        r = va - self.pref_base
+        if not 0 <= r < self.image_size:
+            raise TranslationError(f"address 0x{va:x} outside the image")
+        return r
+
+    def va_expr(self, va: int) -> str:
+        return f"(B + 0x{self.rva(va):x}ull)"
+
+    @staticmethod
+    def fname(va: int) -> str:
+        return f"f_{va:x}"
+
+    @staticmethod
+    def label(va: int) -> str:
+        return f"L_{va:x}"
+
+    def check_relocations(self):
+        exec_ranges = [(s.vaddr, s.vaddr + max(s.vsize, s.raw_size)) for s in self.pe.sections if s.executable]
+        for r in self.pe.relocs:
+            if any(lo <= r < hi for lo, hi in exec_ranges):
+                raise TranslationError(
+                    f"relocation at RVA 0x{r:x} patches code; absolute addresses in instructions are not supported")
+
+    def check_imports(self):
+        for _, dll, name in self.pe.imports:
+            if (dll, name) not in SUPPORTED_IMPORTS:
+                raise TranslationError(f"unsupported import {dll}!{name}")
+
+    # ---- instruction lowering ----------------------------------------------
+    def lift_insn(self, insn: Instruction, fn_entry: int, block_succ: list[int]) -> list[str]:
+        f = _Fn(self, insn)
+        mn = insn.mnemonic
+        if mn == "nop":                     # multi-byte NOPs never access their memory operand
+            return [f"/* 0x{insn.address:x}: nop */"]
+        f.check_prefixes()
+        ops = insn.operands
+        f.emit(f"/* 0x{insn.address:x}: {insn.text} */")
+
+        def with_ea(op):
+            if op.kind == "mem":
+                f.emit(f"ea = {f.ea(op)};")
+                return "ea"
+            return None
+
+        if mn in ("mov", "movabs"):
+            dst, src = f.need(2)
+            if dst.kind == "mem" and src.kind == "mem":
+                raise _err(insn, "memory-to-memory mov")
+            if src.size != dst.size:
+                raise _err(insn, "mov operand sizes differ")
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            f.emit(f.write(dst, f.read(src)))
+        elif mn == "movsxd":
+            dst, src = f.need(2)
+            if not (dst.kind == "reg" and dst.size == 8 and src.size == 4):
+                raise _err(insn, "only movsxd r64, r/m32 is supported")
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            f.emit(f.write(dst, f"x86_sext({f.read(src)}, 32)"))
+        elif mn == "lea":
+            dst, src = f.need(2)
+            if dst.kind != "reg" or src.kind != "mem" or dst.size not in (2, 4, 8):
+                raise _err(insn, "invalid lea form")
+            f.emit(f.write(dst, f.ea(src)))          # x86_set masks/zero-extends to the destination width
+        elif mn in BINOPS:
+            dst, src = f.need(2)
+            if src.size != dst.size:
+                raise _err(insn, "operand sizes differ")
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            e = with_ea(dst)
+            f.emit(f"t = {BINOPS[mn]}(s, {f.read(dst, e)}, {f.read(src)}, {dst.bits});")
+            f.emit(f.write(dst, "t", e))
+        elif mn in CMPOPS:
+            a, b = f.need(2)
+            if a.size != b.size:
+                raise _err(insn, "operand sizes differ")
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            f.emit(f"(void){CMPOPS[mn]}(s, {f.read(a)}, {f.read(b)}, {a.bits});")
+        elif mn in UNOPS:
+            (dst,) = f.need(1)
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            e = with_ea(dst)
+            f.emit(f"t = {UNOPS[mn]}(s, {f.read(dst, e)}, {dst.bits});")
+            f.emit(f.write(dst, "t", e))
+        elif mn == "shr":
+            dst, cnt = f.need(2)
+            if not (cnt.kind == "imm" or (cnt.kind == "reg" and cnt.reg.name == "cl")):
+                raise _err(insn, "shift count must be imm8 or CL")
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            e = with_ea(dst)
+            f.emit(f"t = x86_shr(s, {f.read(dst, e)}, {f.read(cnt)}, {dst.bits});")
+            f.emit(f.write(dst, "t", e))
+        elif mn == "mul":
+            (src,) = f.need(1)
+            if src.size not in (4, 8):
+                raise _err(insn, "mul width")
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            f.emit(f"x86_mul(s, {f.read(src)}, {src.bits});")
+        elif mn == "imul":
+            if len(ops) == 2:
+                dst, src = ops
+                if dst.kind != "reg" or dst.size not in (2, 4, 8) or src.size != dst.size:
+                    raise _err(insn, "invalid two-operand imul")
+                f.emit(f"s->rip = {self.va_expr(insn.address)};")
+                f.emit(f"t = x86_imul2(s, {f.read(dst)}, {f.read(src)}, {dst.bits});")
+                f.emit(f.write(dst, "t"))
+            elif len(ops) == 3:
+                dst, src, imm = ops
+                if dst.kind != "reg" or imm.kind != "imm" or dst.size not in (2, 4, 8):
+                    raise _err(insn, "invalid three-operand imul")
+                f.emit(f"s->rip = {self.va_expr(insn.address)};")
+                f.emit(f"t = x86_imul2(s, {f.read(src)}, {f.read(imm)}, {dst.bits});")
+                f.emit(f.write(dst, "t"))
+            else:
+                raise _err(insn, "one-operand imul is not supported")
+        elif mn == "idiv":
+            (src,) = f.need(1)
+            if src.size not in (4, 8):
+                raise _err(insn, "idiv width")
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            f.emit(f"x86_idiv(s, {f.read(src)}, {src.bits});")
+        elif mn == "cdq":
+            f.need(0)
+            f.emit("x86_cdq(s);")
+        elif mn == "cqo":
+            f.need(0)
+            f.emit("x86_cqo(s);")
+        elif mn.startswith("cmov") and mn[4:] in COND:
+            dst, src = f.need(2)
+            if dst.kind != "reg" or dst.size not in (2, 4, 8) or src.size != dst.size:
+                raise _err(insn, "invalid cmov form")
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            # source is read unconditionally (a memory source may fault even if not taken);
+            # a 32-bit destination is zero-extended whether or not the move happens
+            f.emit(f"t = {f.read(src)};")
+            f.emit(f.write(dst, f"x86_cond(s, {COND_NAMES[COND[mn[4:]]]}) ? t : {f.read(dst)}"))
+        elif mn == "push":
+            (src,) = f.need(1)
+            if src.size != 8:
+                raise _err(insn, "only 64-bit push is supported")
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            f.emit(f"t = {f.read(src)};")         # value (incl. RSP) is read before the decrement
+            f.emit("x86_push64(s, t);")
+        elif mn == "pop":
+            (dst,) = f.need(1)
+            if dst.kind != "reg" or dst.size != 8:
+                raise _err(insn, "only pop r64 is supported")
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            f.emit("t = x86_pop64(s);")
+            f.emit(f.write(dst, "t"))
+        elif mn == "jmp":
+            if insn.direct_target is None:
+                raise _err(insn, "indirect jmp")
+            if insn.direct_target not in self.cur_blocks:
+                raise _err(insn, "jmp leaves the current function (tail call)")
+            f.emit(f"goto {self.label(insn.direct_target)};")
+        elif mn.startswith("j") and mn[1:] in COND:
+            if insn.direct_target is None:
+                raise _err(insn, "indirect conditional jump")
+            f.emit(f"if (x86_cond(s, {COND_NAMES[COND[mn[1:]]]})) goto {self.label(insn.direct_target)};")
+            f.emit(f"goto {self.label(insn.next)};")
+        elif mn == "call":
+            self.lift_call(f, insn)
+        elif mn == "ret":
+            if ops:
+                raise _err(insn, "ret imm16 is not supported")
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            f.emit("s->rip = x86_pop64(s);")
+            f.emit("return;")
+        else:
+            raise _err(insn, "unsupported instruction")
+        return f.lines
+
+    def lift_call(self, f: _Fn, insn: Instruction):
+        ret = self.va_expr(insn.next)
+        site = next((c for c in self.prog.call_sites if c.address == insn.address), None)
+        if site is None:
+            raise _err(insn, "call site missing from CFG")
+        f.emit(f"s->rip = {self.va_expr(insn.address)};")
+        if insn.direct_target is not None:
+            if insn.direct_target not in self.functions:
+                raise _err(insn, "direct call to an undiscovered function")
+            f.emit(f"x86_push64(s, {ret});")
+            f.emit(f"{self.fname(insn.direct_target)}(s);")
+        else:
+            (op,) = f.need(1)
+            if op.size != 8:
+                raise _err(insn, "call target must be 64-bit")
+            f.emit(f"t = {f.read(op)};")           # target is evaluated before the push
+            f.emit(f"x86_push64(s, {ret});")
+            f.emit("exe2mac_dispatch(s, t);")
+        if not site.returns:
+            f.emit(f"exe2mac_noreturn_returned(s, {self.va_expr(insn.address)});")
+        else:
+            f.emit(f"if (s->rip != {ret}) exe2mac_bad_return(s, {ret});")
+
+    # ---- function / program emission --------------------------------------
+    def lift_function(self, fn) -> list[str]:
+        self.cur_blocks = fn.blocks
+        lines = [f"static void {self.fname(fn.entry)}(x86_state *s) {{",
+                 "    uint64_t t, ea;",
+                 "    (void)t; (void)ea;",
+                 f"    goto {self.label(fn.entry)};"]
+        for start in sorted(fn.blocks):
+            b = fn.blocks[start]
+            lines.append(f"{self.label(start)}:")
+            for insn in b.instructions:
+                for l in self.lift_insn(insn, fn.entry, b.successors):
+                    lines.append("    " + l)
+            last = b.instructions[-1]
+            if b.terminator in ("fallthrough", "call"):
+                if len(b.successors) != 1:
+                    raise TranslationError(f"block 0x{start:x}: fall-through without a single successor")
+                lines.append(f"    goto {self.label(b.successors[0])};")
+            elif b.terminator == "call_noreturn":
+                pass                                 # call emission already ends in a fault
+            elif b.terminator in ("ret", "jump", "cond"):
+                pass
+            else:
+                raise TranslationError(f"block 0x{start:x}: unsupported terminator {b.terminator} at 0x{last.address:x}")
+        lines.append("}")
+        return lines
+
+    def emit_image(self) -> list[str]:
+        pe = self.pe
+        img = bytes(pe.image)
+        out = [f"const uint32_t exe2mac_image_size = 0x{pe.size_of_image:x}u;",
+               f"const uint32_t exe2mac_headers_size = 0x{pe.size_of_headers:x}u;",
+               f"const uint64_t exe2mac_preferred_base = 0x{pe.image_base:x}ull;",
+               f"const uint32_t exe2mac_entry_rva = 0x{pe.entry_rva:x}u;",
+               "const uint8_t exe2mac_image_init[] = {"]
+        for i in range(0, len(img), 16):
+            out.append("    " + ",".join(f"0x{b:02x}" for b in img[i:i + 16]) + ",")
+        out.append("};")
+        align = pe.section_alignment or 0x1000
+        out.append("const exe2mac_section exe2mac_sections[] = {")
+        n = 0
+        for s in pe.sections:
+            size = max(s.vsize, 1)
+            size = (size + align - 1) // align * align
+            size = min(size, pe.size_of_image - s.vaddr)
+            perms = ["GUEST_PERM_R"] if s.chars & 0x40000000 else []
+            if s.chars & 0x80000000:
+                perms.append("GUEST_PERM_W")
+            if not perms:
+                raise TranslationError(f"section {s.name} is neither readable nor writable")
+            out.append(f'    {{0x{s.vaddr:x}u, 0x{size:x}u, {" | ".join(perms)}, "{s.name}"}},')
+            n += 1
+        out.append("};")
+        out.append(f"const unsigned exe2mac_nsections = {n}u;")
+        out.append("const uint32_t exe2mac_relocs[] = {" + ", ".join(f"0x{r:x}u" for r in pe.relocs) + ("" if pe.relocs else "0") + "};")
+        out.append(f"const unsigned exe2mac_nrelocs = {len(pe.relocs)}u;")
+        out.append("const exe2mac_import exe2mac_imports[] = {")
+        for slot, dll, name in pe.imports:
+            out.append(f'    {{0x{slot:x}u, "{dll}", "{name}"}},')
+        if not pe.imports:
+            out.append("    {0, 0, 0},")
+        out.append("};")
+        out.append(f"const unsigned exe2mac_nimports = {len(pe.imports)}u;")
+        return out
+
+    def emit(self) -> str:
+        self.check_imports()
+        self.check_relocations()
+        L = ["/* Generated by exe2mac (static recompilation of a PE32+ x86-64 image).",
+             " * Do not edit. Guest state lives in x86_state; see runtime/x86_cpu.h. */",
+             '#include "runtime/exe2mac_rt.h"',
+             "",
+             "#define B g_exe2mac_base",
+             ""]
+        L += self.emit_image()
+        L.append("")
+        for entry in sorted(self.functions):
+            L.append(f"static void {self.fname(entry)}(x86_state *s);")
+        L.append("")
+        for entry in sorted(self.functions):
+            L += self.lift_function(self.functions[entry])
+            L.append("")
+        L.append("void exe2mac_dispatch(x86_state *s, uint64_t target) {")
+        L.append("    switch (target - B) {")
+        for entry in sorted(self.functions):
+            L.append(f"    case 0x{self.rva(entry):x}ull: {self.fname(entry)}(s); return;")
+        L.append("    default: exe2mac_dispatch_external(s, target); return;")
+        L.append("    }")
+        L.append("}")
+        return "\n".join(L) + "\n"
+
+
+def lift_program(pe) -> str:
+    """Discover reachable code and return the generated C translation unit."""
+    return Lifter(pe, discover(pe)).emit()
