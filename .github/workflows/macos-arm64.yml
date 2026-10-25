@@ -58,6 +58,17 @@ jobs:
           echo "--- stdout (hex):"; xxd build/hello.stdout || true
           echo "--- stderr:"; cat build/hello.stderr || true
 
+      - name: Publish key results as annotations
+        if: always()
+        run: |
+          note() { echo "::notice title=$1::$2"; }
+          note host "$(uname -sm) | macOS $(sw_vers -productVersion) | $(sysctl -n machdep.cpu.brand_string)"
+          note binary "$(file -b build/hello 2>&1)"
+          note run "$(grep -E '^exit code:' verify.log) | $(grep -E '^stdout:' verify.log) | stderr bytes=$(wc -c < build/hello.stderr | tr -d ' ')"
+          note stdout-sha256 "translated=$(shasum -a 256 < build/hello.stdout | cut -c1-16) golden=$(shasum -a 256 < test/golden/hello.stdout | cut -c1-16) bytes=$(wc -c < build/hello.stdout | tr -d ' ')"
+          note tests "$(grep -E '^Ran [0-9]+ tests' verify.log | tail -1) -> $(grep -E '^(OK|FAILED)' verify.log | tail -1)"
+          grep -E '\.\.\. skipped' verify.log | head -10 | while IFS= read -r l; do note skipped "$l"; done || true
+
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
