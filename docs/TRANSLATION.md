@@ -124,14 +124,25 @@ Implemented exactly (defined flags computed; undefined flags left unchanged):
   `cvttsd2si` (r32|64), `cvtsd2ss cvtss2sd`, `movsd movss movd movq`,
   128-bit moves `movaps movapd movdqa` (aligned) / `movups movupd movdqu`,
   bitwise `xorps/pd andps/pd andnps/pd orps/pd pxor pand pandn por`.
-  Exact x86 rules are implemented in `runtime/x86_sse.h`: NaN propagation
-  (first operand wins, quieted), QNaN indefinite `0xFFF8000000000000` for
-  invalid operations, integer indefinite for NaN/out-of-range conversions,
-  min/max operand selection, which part of the destination each form writes,
-  and 16-byte alignment of legacy-SSE m128 operands (→ access violation).
-  Assumes the default MXCSR (round-to-nearest, no FTZ/DAZ, exceptions masked);
-  MXCSR is not modelled, so `ldmxcsr`/`stmxcsr`, `cvtsd2si` (current rounding
-  mode) and x87 are rejected.
+  All floating-point arithmetic runs through `runtime/softfloat.h` (written
+  for exe2mac): every result is computed exactly in integers and rounded once
+  according to the modelled **MXCSR** — rounding control (RN/RD/RU/RZ), FTZ,
+  DAZ — and the six sticky exception flags (IE DE ZE OE UE PE) are updated
+  exactly as SSE does. x86 details settled against hardware: tininess is
+  detected *after* rounding; FTZ flushes every tiny result and sets UE|PE;
+  DAZ turns denormal inputs into signed zeros without DE; a zero divisor
+  raises ZE without DE; min/max under DAZ return a flushed operand as zero;
+  NaN results follow the first-operand rule with the negative QNaN
+  indefinite for invalid operations. `ldmxcsr`/`stmxcsr` load/store the
+  register (reserved bits → access violation); `cvtsd2si` uses the current
+  rounding mode, `cvttsd2si` truncates. An exception whose mask bit is clear
+  raises #XM; without SEH this ends the process with
+  STATUS_FLOAT_MULTIPLE_FAULTS (0xC00002B4, for IE/DE/ZE) or
+  STATUS_FLOAT_MULTIPLE_TRAPS (0xC00002B5, for OE/UE/PE). The host FPU is not
+  used for guest arithmetic, so ARM64 results and flags are identical.
+  Cost: software arithmetic is slower than native FP; there is no fast path
+  yet. Generated C is still compiled with `-ffp-contract=off`.
+  Not modelled: x87, `fxsave`/`xsave`, SSSE3/SSE4/AVX.
 * Packed SSE2 (`runtime/x86_simd.h`, lane loops, host-endianness independent):
   `padd/psub b w d q`, `pcmpeq/pcmpgt b w d`, `pmullw pmuludq`,
   `pminub pmaxub pminsw pmaxsw`, `packuswb packsswb packssdw`,
@@ -163,6 +174,7 @@ unsupported imports, code relocations.
 | `test/fp.exe` | `EXTRA_CFLAGS=-fno-math-errno sh scripts/build_fixture.sh test/fp.c test/fp.exe` | exit 27 | `test/golden/fp_model.py` (SDM NaN rules) + Windows CI job |
 | `test/vec.exe` | `sh scripts/build_fixture.sh test/vec.c test/vec.exe` (auto-vectorised) | exit 42 | `test/golden/vec_model.py` + Windows CI job |
 | `test/tail.exe` | `sh scripts/build_fixture.sh test/tail.c test/tail.exe` | exit 13 | `test/golden/tail_model.py` + Windows CI job |
+| `test/mxcsr.exe` | `sh scripts/build_fixture.sh test/mxcsr.c test/mxcsr.exe` | ends with unmasked #XM: exit 0xB4 (Windows 0xC00002B4) | `test/golden/mxcsr_model.py` (exact rational arithmetic) + Windows CI job via `test/mxcsr.windows.bat` |
 | `test/io.exe` | `sh scripts/build_fixture.sh test/io.c test/io.exe` (default -O2, auto-vectorised) | exit 5 with args `alpha "b c" q\"uote "back\slash\\" ""` and stdin `test/golden/io.input` | `test/golden/io_model.py` + Windows CI job via `test/io.windows.bat` |
 
 ## Verification
@@ -171,6 +183,9 @@ unsupported imports, code relocations.
   (8.1 M cases vs the real SSE unit, x86 hosts only).
 * `tests/c/test_simd.c` (portable) and `tests/c/diff_simd.c` (18.6 M packed
   cases vs the real SSE2 unit), mutation-checked.
+* `tests/c/diff_mxcsr.c`: 19.8 M cases over all 16 RC×FTZ×DAZ settings,
+  comparing result bits and MXCSR flags with hardware (mutation-checked);
+  `tests/c/test_mxcsr.c` replays 640 hardware-recorded vectors on any host.
 * `tests/c/diff_x86.c`: 5.8 M cases against the real CPU (x86-64 hosts only;
   test-only oracle, never part of a translated program). Mutation-checked.
 * `tests/test_lifter.py`: lifted snippets compiled, executed, final state compared.

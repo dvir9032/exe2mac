@@ -120,7 +120,7 @@ jobs:
         run: |
           ver="$(cmd.exe //c ver | tr -d '\r' | tr -s '\n' ' ')"
           status=0
-          for spec in hello:7 ops:102 switch:50 fp:27 io:5 vec:42 tail:13; do
+          for spec in hello:7 ops:102 switch:50 fp:27 io:5 vec:42 tail:13 mxcsr:180; do
             name=${spec%%:*}; want=${spec##*:}
             set +e
             if [ -f test/$name.windows.bat ]; then
@@ -130,10 +130,16 @@ jobs:
             fi
             code=$?
             set -e
+            full=""
+            if [ -f $name.win.code ]; then                  # full NTSTATUS from %ERRORLEVEL%
+              full=$(tr -d '\r ' < $name.win.code)
+              code=$(( full & 0xff ))
+              full=" full=$(printf '0x%08x' $(( full & 0xffffffff )))"
+            fi
             h_win=$(sha256sum < $name.win.stdout | cut -d' ' -f1)
             h_gold=$(sha256sum < test/golden/$name.stdout | cut -d' ' -f1)
             same=MISMATCH; [ "$h_win" = "$h_gold" ] && same=MATCH
-            echo "::notice title=windows-reference-$name::host=$ver $(uname -m) | exit=$code (want $want) | stdout=$same | bytes=$(wc -c < $name.win.stdout | tr -d ' ') | sha256=$h_win golden=$h_gold | stderr_bytes=$(wc -c < $name.win.stderr | tr -d ' ')"
+            echo "::notice title=windows-reference-$name::host=$ver $(uname -m) | exit=$code (want $want)$full | stdout=$same | bytes=$(wc -c < $name.win.stdout | tr -d ' ') | sha256=$h_win golden=$h_gold | stderr_bytes=$(wc -c < $name.win.stderr | tr -d ' ')"
             if [ "$same" != MATCH ]; then diff $name.win.stdout test/golden/$name.stdout || true; status=1; fi
             [ "$code" -eq "$want" ] || status=1
           done

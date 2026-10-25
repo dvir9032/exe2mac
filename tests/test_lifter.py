@@ -275,6 +275,36 @@ class LiftedPackedSSETests(_SnippetCheck, unittest.TestCase):
         self.assertIn(b"misaligned 128-bit operand", r.stderr)
 
 
+@unittest.skipUnless(CC and dec.capstone is not None, "C compiler and capstone required")
+class LiftedMXCSRTests(_SnippetCheck, unittest.TestCase):
+    RZ = ("4883ec180fae1c248b1c24810c24006000000fae142448b8000000000000f03f66480f6ec048b8000000000000244066480f6ec8"
+          "f20f5ec166490f7ec00fae5c24048b4c240448b8000000000000064066480f6ed0f24c0f2dca812424ff9fffff0fae1424"
+          "f24c0f2dd24883c418c3")
+
+    def test_rounding_control_and_sticky_flags(self):
+        t = texts(self.RZ)
+        for want in ("stmxcsr dword ptr [rsp]", "ldmxcsr dword ptr [rsp]", "divsd xmm0, xmm1", "cvtsd2si r9, xmm2"):
+            self.assertIn(want, t)
+        self.check(self.RZ, {
+            "rbx": 0x1F80,                   # Windows default MXCSR
+            "rax": 0x4006000000000000,       # 2.75
+            "r8": 0x3FB9999999999999,        # 1/10 rounded toward zero (RN would give ...9A)
+            "rcx": 0x7FA0,                   # RC=11 (RZ) + sticky PE from the inexact division
+            "r9": 2,                         # cvtsd2si(2.75) under RZ
+            "r10": 3,                        # ... and under RN after restoring RC
+        }, {"cf": 0, "pf": 1, "af": 0, "zf": 0, "sf": 0, "of": 0})
+
+    def test_reserved_mxcsr_bit_faults(self):
+        r = snippet_exit_status("4883ec08c70424801f01000fae14244883c408c3")    # ldmxcsr 0x11F80
+        self.assertEqual(r.returncode, 0x05)
+        self.assertIn(b"reserved MXCSR bit", r.stderr)
+
+    def test_unmasked_divide_by_zero_raises_simd_exception(self):
+        r = snippet_exit_status("4883ec08c70424801d00000fae1424660fefc948b8000000000000f03f66480f6ec0f20f5ec14883c408c3")
+        self.assertEqual(r.returncode, 0xB4)                                   # STATUS_FLOAT_MULTIPLE_FAULTS & 0xff
+        self.assertIn(b"unmasked SSE floating-point exception", r.stderr)
+
+
 @unittest.skipUnless(dec.capstone is not None, "capstone required")
 class FailClosedLifterTests(unittest.TestCase):
     def lift(self, code_hex, **kw):
@@ -304,9 +334,9 @@ class FailClosedLifterTests(unittest.TestCase):
         self.assertIn(b"no translated code", r.stderr)
 
     def test_unsupported_sse(self):
-        self.assertRejected("f20f2dc0c3", "register xmm0 is not supported")      # cvtsd2si (rounding mode)
+        self.assertRejected("f30f2dc0c3", "register xmm0 is not supported")      # cvtss2si (not implemented)
         self.assertRejected("660ff5c1c3", "register xmm0 is not supported")      # pmaddwd (not implemented)
-        self.assertRejected("0fae1424c3", "unsupported instruction.*ldmxcsr")    # MXCSR changes
+        self.assertRejected("0fae00c3", "unsupported instruction.*fxsave")       # fxsave [rax] (x87/SSE state save)
 
     def test_rep_prefix(self):
         self.assertRejected("f3abc3", "REP")                                     # rep stosd (only stosb/movsb)

@@ -67,10 +67,10 @@ SIMD_BINARY = {
     "punpcklqdq": "v_unpack(a, b, 64, 0)", "punpckhqdq": "v_unpack(a, b, 64, 1)",
     "unpcklps": "v_unpack(a, b, 32, 0)", "unpckhps": "v_unpack(a, b, 32, 1)",
     "unpcklpd": "v_unpack(a, b, 64, 0)", "unpckhpd": "v_unpack(a, b, 64, 1)",
-    "addps": "v_fp32(a, b, SSE_ADD)", "subps": "v_fp32(a, b, SSE_SUB)",
-    "mulps": "v_fp32(a, b, SSE_MUL)", "divps": "v_fp32(a, b, SSE_DIV)",
-    "addpd": "v_fp64(a, b, SSE_ADD)", "subpd": "v_fp64(a, b, SSE_SUB)",
-    "mulpd": "v_fp64(a, b, SSE_MUL)", "divpd": "v_fp64(a, b, SSE_DIV)",
+    "addps": "v_fp32(s, a, b, SSE_ADD)", "subps": "v_fp32(s, a, b, SSE_SUB)",
+    "mulps": "v_fp32(s, a, b, SSE_MUL)", "divps": "v_fp32(s, a, b, SSE_DIV)",
+    "addpd": "v_fp64(s, a, b, SSE_ADD)", "subpd": "v_fp64(s, a, b, SSE_SUB)",
+    "mulpd": "v_fp64(s, a, b, SSE_MUL)", "divpd": "v_fp64(s, a, b, SSE_DIV)",
 }
 SIMD_SHIFT = {"psllw": (16, 0), "pslld": (32, 0), "psllq": (64, 0),
               "psrlw": (16, 1), "psrld": (32, 1), "psrlq": (64, 1),
@@ -84,7 +84,7 @@ SSE_MNEMONICS = (set(SSE_ARITH_SD) | set(SSE_ARITH_SS) | SSE_MOV128_ALIGNED | SS
                  | set(SSE_BITWISE) | set(SSE_CMP_SD) | set(SIMD_BINARY) | set(SIMD_SHIFT)
                  | set(SIMD_BYTESHIFT) | set(SIMD_SHUF_IMM) | set(SIMD_MOVMSK) | {"cvtsi2ss"}
                  | {"movsd", "movss", "movd", "movq", "sqrtsd", "minsd", "maxsd", "ucomisd", "comisd",
-                    "cmpsd", "cvtsd2ss", "cvtss2sd", "cvtsi2sd", "cvttsd2si"})
+                    "cmpsd", "cvtsd2ss", "cvtss2sd", "cvtsi2sd", "cvttsd2si", "cvtsd2si"})
 CMPOPS = {"cmp": "x86_sub", "test": "x86_and"}
 UNOPS = {"inc": "x86_inc", "dec": "x86_dec", "neg": "x86_neg"}
 
@@ -379,6 +379,15 @@ class Lifter:
         elif mn in SSE_MNEMONICS and any(o.kind == "reg" and o.reg.kind == "xmm" for o in ops):
             f.emit(f"s->rip = {self.va_expr(insn.address)};")
             self.lift_sse(f, insn)
+        elif mn in ("ldmxcsr", "stmxcsr"):
+            (m32,) = f.need(1)
+            if m32.kind != "mem" or m32.size != 4:
+                raise _err(insn, f"{mn} needs an m32 operand")
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            if mn == "ldmxcsr":
+                f.emit(f"sse_ldmxcsr(s, (uint32_t)guest_ld32(s->mem, {f.ea(m32)}));")
+            else:
+                f.emit(f"guest_st32(s->mem, {f.ea(m32)}, s->mxcsr);")
         elif mn == "push":
             (src,) = f.need(1)
             if src.size != 8:
@@ -476,21 +485,21 @@ class Lifter:
         if mn in SSE_ARITH_SD:                      # low qword = op(dst, src); high preserved
             dst, src = f.need(2)
             d = xmm(dst)
-            f.emit(f"s->xmm[{d}].lo = sse_f64_arith(s->xmm[{d}].lo, {src64(src)}, {SSE_ARITH_SD[mn]});")
+            f.emit(f"s->xmm[{d}].lo = sse_f64_arith(s, s->xmm[{d}].lo, {src64(src)}, {SSE_ARITH_SD[mn]});")
         elif mn in SSE_ARITH_SS:                    # low dword only
             dst, src = f.need(2)
             d = xmm(dst)
-            f.emit(f"xmm_set_lo32(s, {d}, sse_f32_arith((uint32_t)s->xmm[{d}].lo, {src32(src)}, {SSE_ARITH_SS[mn]}));")
+            f.emit(f"xmm_set_lo32(s, {d}, sse_f32_arith(s, (uint32_t)s->xmm[{d}].lo, {src32(src)}, {SSE_ARITH_SS[mn]}));")
         elif mn == "sqrtsd":
             dst, src = f.need(2)
-            f.emit(f"s->xmm[{xmm(dst)}].lo = sse_f64_sqrt({src64(src)});")
+            f.emit(f"s->xmm[{xmm(dst)}].lo = sse_f64_sqrt(s, {src64(src)});")
         elif mn in ("minsd", "maxsd"):
             dst, src = f.need(2)
             d = xmm(dst)
-            f.emit(f"s->xmm[{d}].lo = sse_f64_{mn[:3]}(s->xmm[{d}].lo, {src64(src)});")
+            f.emit(f"s->xmm[{d}].lo = sse_f64_{mn[:3]}(s, s->xmm[{d}].lo, {src64(src)});")
         elif mn in ("ucomisd", "comisd"):
             a, b = f.need(2)
-            f.emit(f"sse_f64_ucomi(s, s->xmm[{xmm(a)}].lo, {src64(b)});")
+            f.emit(f"sse_f64_{'ucomi' if mn == 'ucomisd' else 'comi'}(s, s->xmm[{xmm(a)}].lo, {src64(b)});")
         elif mn in SSE_CMP_SD or mn == "cmpsd":
             if mn == "cmpsd":
                 dst, src, imm = f.need(3)
@@ -501,7 +510,7 @@ class Lifter:
                 dst, src = f.need(2)
                 pred = SSE_CMP_SD[mn]
             d = xmm(dst)
-            f.emit(f"s->xmm[{d}].lo = sse_f64_cmp(s->xmm[{d}].lo, {src64(src)}, {pred}u);")
+            f.emit(f"s->xmm[{d}].lo = sse_f64_cmp(s, s->xmm[{d}].lo, {src64(src)}, {pred}u);")
         elif mn == "movsd":
             dst, src = f.need(2)
             if dst.kind == "reg" and src.kind == "mem":       # load: zero the high qword
@@ -606,23 +615,23 @@ class Lifter:
             dst, src = f.need(2)
             if src.kind not in ("reg", "mem") or src.size not in (4, 8) or (src.kind == "reg" and src.reg.kind != "gpr"):
                 raise _err(insn, "cvtsi2ss source must be r/m32 or r/m64")
-            f.emit(f"xmm_set_lo32(s, {xmm(dst)}, sse_cvtsi2ss({f.read(src)}, {src.bits}));")
+            f.emit(f"xmm_set_lo32(s, {xmm(dst)}, sse_cvtsi2ss(s, {f.read(src)}, {src.bits}));")
         elif mn == "cvtsd2ss":
             dst, src = f.need(2)
-            f.emit(f"xmm_set_lo32(s, {xmm(dst)}, sse_cvtsd2ss({src64(src)}));")
+            f.emit(f"xmm_set_lo32(s, {xmm(dst)}, sse_cvtsd2ss(s, {src64(src)}));")
         elif mn == "cvtss2sd":
             dst, src = f.need(2)
-            f.emit(f"xmm_set_lo64(s, {xmm(dst)}, sse_cvtss2sd({src32(src)}));")
+            f.emit(f"xmm_set_lo64(s, {xmm(dst)}, sse_cvtss2sd(s, {src32(src)}));")
         elif mn == "cvtsi2sd":
             dst, src = f.need(2)
             if src.kind not in ("reg", "mem") or src.size not in (4, 8) or (src.kind == "reg" and src.reg.kind != "gpr"):
                 raise _err(insn, "cvtsi2sd source must be r/m32 or r/m64")
-            f.emit(f"xmm_set_lo64(s, {xmm(dst)}, sse_cvtsi2sd({f.read(src)}, {src.bits}));")
-        elif mn == "cvttsd2si":
+            f.emit(f"xmm_set_lo64(s, {xmm(dst)}, sse_cvtsi2sd(s, {f.read(src)}, {src.bits}));")
+        elif mn in ("cvttsd2si", "cvtsd2si"):
             dst, src = f.need(2)
             if dst.kind != "reg" or dst.reg.kind != "gpr" or dst.reg.width not in (32, 64):
                 raise _err(insn, "cvttsd2si destination must be r32 or r64")
-            f.emit(f.write(dst, f"sse_cvttsd2si({src64(src)}, {dst.reg.width})"))
+            f.emit(f.write(dst, f"sse_{mn}(s, {src64(src)}, {dst.reg.width})"))
         else:
             raise _err(insn, "unsupported SSE instruction")
 

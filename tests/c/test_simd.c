@@ -7,6 +7,9 @@
 
 #include "runtime/x86_simd.h"
 
+/* guest state with the Windows default MXCSR (0x1F80: all exceptions masked) */
+static x86_state G = { .mxcsr = 0x1F80u };
+
 static int failures, checks;
 #define EQ(a, b) do { uint64_t _a = (uint64_t)(a), _b = (uint64_t)(b); checks++; if (_a != _b) { failures++; \
     fprintf(stderr, "%s:%d: %s == 0x%016" PRIx64 ", expected 0x%016" PRIx64 "\n", __FILE__, __LINE__, #a, _a, _b); } } while (0)
@@ -54,11 +57,11 @@ int main(void) {
     EQ(v_movmsk(V(0x80000000000000ffull, 0x7f00000000000080ull), 8), 0x0181u);
     EQ(v_movmsk(V(0x8000000000000000ull, 0x0000000080000000ull), 32), 0x6u);
     EQ(v_mullw(V(0x8000ffff0003ull, 0), V(0x00020002fffeull, 0)).lo, 0x0000fffefffaull);
-    EQ(v_fp64(V(0x3ff0000000000000ull, 0), V(0x4000000000000000ull, 0), SSE_ADD).lo, 0x4008000000000000ull);
-    EQ(v_fp64(V(0, 0), V(0, 0), SSE_DIV).hi, F64_INDEFINITE);         /* 0/0 lane -> negative QNaN */
-    EQ(v_fp32(V(0x3f80000000000000ull, 0), V(0x3f80000000000000ull, 0), SSE_ADD).lo, 0x4000000000000000ull);
-    for (unsigned i = 0; i < sizeof cvt / sizeof cvt[0]; i++) EQ(sse_cvtsi2ss(cvt[i].in, 64), cvt[i].out);
-    EQ(sse_cvtsi2ss(0xFFFFFFFF00000005ull, 32), 0x40a00000u);         /* only the low 32 bits */
+    EQ(v_fp64(&G, V(0x3ff0000000000000ull, 0), V(0x4000000000000000ull, 0), SSE_ADD).lo, 0x4008000000000000ull);
+    EQ(v_fp64(&G, V(0, 0), V(0, 0), SSE_DIV).hi, F64_INDEFINITE);         /* 0/0 lane -> negative QNaN */
+    EQ(v_fp32(&G, V(0x3f80000000000000ull, 0), V(0x3f80000000000000ull, 0), SSE_ADD).lo, 0x4000000000000000ull);
+    for (unsigned i = 0; i < sizeof cvt / sizeof cvt[0]; i++) EQ(sse_cvtsi2ss(&G, cvt[i].in, 64), cvt[i].out);
+    EQ(sse_cvtsi2ss(&G, 0xFFFFFFFF00000005ull, 32), 0x40a00000u);         /* only the low 32 bits */
     printf("checks=%d failures=%d\n", checks, failures);
     return failures ? 1 : 0;
 }

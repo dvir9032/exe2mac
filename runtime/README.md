@@ -11,7 +11,8 @@
 | `winapi_bridge.c` | Windows x64 ABI → host bridges for the supported kernel32 imports (see `docs/TRANSLATION.md`) |
 | `process.h/.c` | process heap, command line (Windows quoting), last-error value, VirtualAlloc regions |
 | `guest_heap.h/.c` | first-fit allocator for the guest heap (host-side metadata) |
-| `x86_sse.h` | scalar SSE/SSE2 semantics (bit-exact, x86 NaN rules) |
+| `softfloat.h` | exact binary64/binary32 arithmetic with MXCSR rounding, FTZ/DAZ and exception flags |
+| `x86_sse.h` | scalar SSE/SSE2 semantics on top of softfloat.h, MXCSR handling |
 | `x86_simd.h` | packed SSE2 semantics (lane loops) |
 | `winapi_shims.c/.h` | host POSIX implementations used by the bridges |
 | `main.c` | process start-up for a translated program |

@@ -171,31 +171,21 @@ static inline uint32_t v_movmsk(v128 a, unsigned bits) {     /* sign bit of each
 }
 
 /* ---- packed floating point (lane-wise scalar rules) ------------------------ */
-static inline v128 v_fp32(v128 a, v128 b, int op) {
+/* Lanes are computed with flags accumulated, then recorded once (so an
+ * unmasked exception in any lane faults before the destination is written). */
+static inline v128 v_fp32(x86_state *s, v128 a, v128 b, int op) {
+    sf_env e = sse_env(s); unsigned fl = 0;
+    v128 r = a;
     for (unsigned i = 0; i < 4; i++)
-        a = v_put(a, 32, i, sse_f32_arith((uint32_t)v_get(a, 32, i), (uint32_t)v_get(b, 32, i), op));
-    return a;
-}
-static inline v128 v_fp64(v128 a, v128 b, int op) {
-    v128 r = { sse_f64_arith(a.lo, b.lo, op), sse_f64_arith(a.hi, b.hi, op) };
+        r = v_put(r, 32, i, sf_arith(&SF_F32, &e, v_get(a, 32, i), v_get(b, 32, i), op, &fl));
+    sse_flags(s, fl);
     return r;
 }
-
-/* CVTSI2SS: signed integer -> float, correctly rounded (round-to-nearest-even)
- * without relying on how the host compiler converts int64 to float. */
-static inline uint32_t sse_cvtsi2ss(uint64_t v, unsigned bits) {
-    int64_t i = (int64_t)x86_sext(v, bits);
-    uint64_t mag = i < 0 ? 0 - (uint64_t)i : (uint64_t)i;
-    if (mag >> 53) {                       /* keep 53 bits, fold the rest into a sticky bit */
-        unsigned sh = 0;
-        while ((mag >> sh) >> 53) sh++;
-        uint64_t lost = mag & ((1ull << sh) - 1);
-        mag = ((mag >> sh) | (lost != 0)) << sh;   /* still exactly representable in a double */
-    }
-    double d = (double)mag;                /* exact */
-    float f = (float)d;                    /* single correctly rounded step (sticky bit preserves ties) */
-    uint32_t b = f32_bits(f);
-    return i < 0 ? b | 0x80000000u : b;
+static inline v128 v_fp64(x86_state *s, v128 a, v128 b, int op) {
+    sf_env e = sse_env(s); unsigned fl = 0;
+    v128 r = { sf_arith(&SF_F64, &e, a.lo, b.lo, op, &fl), sf_arith(&SF_F64, &e, a.hi, b.hi, op, &fl) };
+    sse_flags(s, fl);
+    return r;
 }
 
 #endif

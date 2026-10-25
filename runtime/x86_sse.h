@@ -1,20 +1,15 @@
-/* exe2mac scalar SSE/SSE2 semantics.
+/* exe2mac scalar SSE/SSE2 semantics with a modelled MXCSR.
  *
- * Values are carried as raw bits (uint64_t for double, uint32_t for float).
- * Arithmetic on non-NaN inputs uses the host's IEEE-754 binary64/binary32
- * operations, which are correctly rounded on both x86-64 SSE and ARM64 under
- * the default environment (round-to-nearest-even, no flush-to-zero /
- * denormals-are-zero). That matches the Windows x64 default MXCSR (0x1F80).
- * Generated code must be compiled with -ffp-contract=off so the host compiler
- * never fuses a multiply and an add.
+ * All floating-point arithmetic goes through runtime/softfloat.h: results are
+ * computed exactly in integers and rounded once according to MXCSR.RC, with
+ * FTZ / DAZ and the six sticky exception flags exactly as x86 SSE does
+ * (verified against hardware in all 16 RC x FTZ x DAZ settings). The host FPU
+ * is never used for guest arithmetic, so ARM64 hosts produce identical bits
+ * and flags (NaN encodings, underflow detection, signed zeros).
  *
- * NaN results follow the x86 rules (Intel SDM Vol. 1, Table 4-7) explicitly,
- * because ARM64 propagates and generates NaNs differently:
- *   - first source is NaN  -> first source, quieted
- *   - else second is NaN   -> second source, quieted
- *   - invalid operation    -> "QNaN floating-point indefinite"
- *                             (0xFFF8000000000000 / 0xFFC00000, sign bit SET)
- * MXCSR exception flags are not modelled; all exceptions are masked (default).
+ * Exception flags are ORed into x86_state.mxcsr. An exception whose mask bit
+ * is clear raises an SSE floating-point exception (#XM). There is no SEH, so
+ * it ends the process with the Windows status code (see sse_flags()).
  */
 #ifndef EXE2MAC_X86_SSE_H
 #define EXE2MAC_X86_SSE_H
@@ -24,6 +19,7 @@
  * freestanding-compilable for any target. __builtin_sqrt lowers to the
  * correctly rounded hardware instruction (sqrtsd on x86-64, fsqrt on ARM64). */
 
+#include "softfloat.h"
 #include "x86_cpu.h"
 
 #define F64_INDEFINITE 0xFFF8000000000000ull
@@ -43,105 +39,156 @@ static inline int f32_isnan(uint32_t b) { return (b & 0x7F800000u) == 0x7F800000
 
 enum { SSE_ADD, SSE_SUB, SSE_MUL, SSE_DIV };
 
-static inline uint64_t sse_f64_arith(uint64_t a, uint64_t b, int op) {
-    if (f64_isnan(a)) return a | F64_QUIET_BIT;
-    if (f64_isnan(b)) return b | F64_QUIET_BIT;
-    double x = f64_of(a), y = f64_of(b), r;
+#define EXE2MAC_MXCSR_DEFAULT                0x1F80u
+#define EXE2MAC_STATUS_FLOAT_MULTIPLE_FAULTS 0xC00002B4u   /* #XM from IE / DE / ZE */
+#define EXE2MAC_STATUS_FLOAT_MULTIPLE_TRAPS  0xC00002B5u   /* #XM from OE / UE / PE */
+
+static inline sf_env sse_env(const x86_state *s) { return sf_env_of(s->mxcsr); }
+
+/* Record exception flags; raise #XM for any unmasked one. */
+static inline void sse_flags(x86_state *s, unsigned fl) {
+    s->mxcsr |= fl & 0x3fu;
+    unsigned unmasked = fl & ~(s->mxcsr >> 7) & 0x3fu;
+    if (unmasked)
+        exe2mac_raise(s, (unmasked & (SF_IE | SF_DE | SF_ZE)) ? EXE2MAC_STATUS_FLOAT_MULTIPLE_FAULTS
+                                                              : EXE2MAC_STATUS_FLOAT_MULTIPLE_TRAPS,
+                      "unmasked SSE floating-point exception");
+}
+
+static inline uint64_t sf_arith(const sf_fmt *f, const sf_env *e, uint64_t a, uint64_t b, int op, unsigned *fl) {
     switch (op) {
-    case SSE_ADD: r = x + y; break;
-    case SSE_SUB: r = x - y; break;
-    case SSE_MUL: r = x * y; break;
-    default:      r = x / y; break;
+    case SSE_ADD: return sf_add(f, e, a, b, 0, fl);
+    case SSE_SUB: return sf_add(f, e, a, b, 1, fl);
+    case SSE_MUL: return sf_mul(f, e, a, b, fl);
+    default:      return sf_div(f, e, a, b, fl);
     }
-    uint64_t rb = f64_bits(r);
-    return f64_isnan(rb) ? F64_INDEFINITE : rb;      /* invalid: inf-inf, 0*inf, 0/0, inf/inf */
+}
+static inline uint64_t sse_f64_arith(x86_state *s, uint64_t a, uint64_t b, int op) {
+    sf_env e = sse_env(s); unsigned fl = 0;
+    uint64_t r = sf_arith(&SF_F64, &e, a, b, op, &fl);
+    sse_flags(s, fl);
+    return r;
+}
+static inline uint32_t sse_f32_arith(x86_state *s, uint32_t a, uint32_t b, int op) {
+    sf_env e = sse_env(s); unsigned fl = 0;
+    uint32_t r = (uint32_t)sf_arith(&SF_F32, &e, a, b, op, &fl);
+    sse_flags(s, fl);
+    return r;
+}
+static inline uint64_t sse_f64_sqrt(x86_state *s, uint64_t b) {
+    sf_env e = sse_env(s); unsigned fl = 0;
+    uint64_t r = sf_sqrt(&SF_F64, &e, b, &fl);
+    sse_flags(s, fl);
+    return r;
+}
+static inline uint32_t sse_f32_sqrt(x86_state *s, uint32_t b) {
+    sf_env e = sse_env(s); unsigned fl = 0;
+    uint32_t r = (uint32_t)sf_sqrt(&SF_F32, &e, b, &fl);
+    sse_flags(s, fl);
+    return r;
 }
 
-static inline uint32_t sse_f32_arith(uint32_t a, uint32_t b, int op) {
-    if (f32_isnan(a)) return a | F32_QUIET_BIT;
-    if (f32_isnan(b)) return b | F32_QUIET_BIT;
-    float x = f32_of(a), y = f32_of(b), r;
-    switch (op) {
-    case SSE_ADD: r = x + y; break;
-    case SSE_SUB: r = x - y; break;
-    case SSE_MUL: r = x * y; break;
-    default:      r = x / y; break;
-    }
-    uint32_t rb = f32_bits(r);
-    return f32_isnan(rb) ? F32_INDEFINITE : rb;
+/* Pre-computation flags shared by compare-type instructions:
+ * IE for SNaN (or for any NaN when `signalling`), DE for a denormal source
+ * that is not flushed by DAZ when no NaN is involved. */
+static inline unsigned sse_cmp_flags(const sf_env *e, const sf_num *a, const sf_num *b, int signalling) {
+    unsigned fl = 0;
+    int qn = a->cls == SF_QNAN || b->cls == SF_QNAN, sn = a->cls == SF_SNAN || b->cls == SF_SNAN;
+    if (sn || (signalling && qn)) fl |= SF_IE;
+    if (!sn && !qn && !e->daz && (a->denormal || b->denormal)) fl |= SF_DE;
+    return fl;
 }
 
-static inline uint64_t sse_f64_sqrt(uint64_t b) {
-    if (f64_isnan(b)) return b | F64_QUIET_BIT;
-    uint64_t rb = f64_bits(__builtin_sqrt(f64_of(b)));          /* sqrt(-0) = -0 per IEEE */
-    return f64_isnan(rb) ? F64_INDEFINITE : rb;
+/* MAXSD/MINSD (and SS): dst = (a OP b) ? a : b after DAZ; any NaN or a
+ * (+0, -0) pair returns the SECOND operand. IE for any NaN. */
+static inline uint64_t sse_minmax(x86_state *s, const sf_fmt *f, uint64_t a, uint64_t b, int want_max) {
+    sf_env e = sse_env(s);
+    sf_num x = sf_unpack(f, a, &e), y = sf_unpack(f, b, &e);
+    sse_flags(s, sse_cmp_flags(&e, &x, &y, 1));
+    int c = sf_compare(f, &x, &y);
+    uint64_t pick = (c != 2 && (want_max ? c > 0 : c < 0)) ? a : b;
+    /* x86: a denormal flushed by DAZ is returned as a signed zero */
+    sf_num chosen = pick == a ? x : y;
+    if (e.daz && chosen.denormal) return sf_zero(f, chosen.sign);
+    return pick;
 }
-
-/* MAXSD/MINSD: dest = (a OP b) ? a : b. Any NaN or (+0,-0) pair returns the
- * SECOND operand unchanged (not quieted) - exactly this C expression. */
-static inline uint64_t sse_f64_max(uint64_t a, uint64_t b) { return f64_of(a) > f64_of(b) ? a : b; }
-static inline uint64_t sse_f64_min(uint64_t a, uint64_t b) { return f64_of(a) < f64_of(b) ? a : b; }
+static inline uint64_t sse_f64_max(x86_state *s, uint64_t a, uint64_t b) { return sse_minmax(s, &SF_F64, a, b, 1); }
+static inline uint64_t sse_f64_min(x86_state *s, uint64_t a, uint64_t b) { return sse_minmax(s, &SF_F64, a, b, 0); }
 
 /* UCOMISD/COMISD: ZF,PF,CF = 111 unordered, 000 greater, 001 less, 100 equal;
- * OF=SF=AF=0. (COMISD differs only in signalling QNaN, which is masked.) */
-static inline void sse_f64_ucomi(x86_state *s, uint64_t a, uint64_t b) {
+ * OF=SF=AF=0. UCOMISD signals IE only for SNaN, COMISD for any NaN. */
+static inline void sse_ucomi(x86_state *s, const sf_fmt *f, uint64_t a, uint64_t b, int signalling) {
+    sf_env e = sse_env(s);
+    sf_num x = sf_unpack(f, a, &e), y = sf_unpack(f, b, &e);
+    sse_flags(s, sse_cmp_flags(&e, &x, &y, signalling));
+    int c = sf_compare(f, &x, &y);
     s->of = s->sf = s->af = 0;
-    if (f64_isnan(a) || f64_isnan(b)) { s->zf = s->pf = s->cf = 1; return; }
-    double x = f64_of(a), y = f64_of(b);
-    s->pf = 0;
-    s->zf = x == y;
-    s->cf = x < y;
+    s->zf = c == 0 || c == 2;
+    s->pf = c == 2;
+    s->cf = c < 0 || c == 2;
 }
+static inline void sse_f64_ucomi(x86_state *s, uint64_t a, uint64_t b) { sse_ucomi(s, &SF_F64, a, b, 0); }
+static inline void sse_f64_comi(x86_state *s, uint64_t a, uint64_t b) { sse_ucomi(s, &SF_F64, a, b, 1); }
 
-/* CMPSD predicate imm8[2:0]: EQ LT LE UNORD NEQ NLT NLE ORD -> all-ones/zeros mask. */
-static inline uint64_t sse_f64_cmp(uint64_t a, uint64_t b, unsigned pred) {
-    int un = f64_isnan(a) || f64_isnan(b);
-    double x = f64_of(a), y = f64_of(b);
-    int r;
-    switch (pred & 7) {
-    case 0: r = !un && x == y; break;
-    case 1: r = !un && x < y; break;
-    case 2: r = !un && x <= y; break;
+/* CMPSD predicate imm8[2:0]: EQ LT LE UNORD NEQ NLT NLE ORD -> all-ones/zeros mask.
+ * LT/LE/NLT/NLE signal IE on any NaN; the others only on SNaN. */
+static inline uint64_t sse_f64_cmp(x86_state *s, uint64_t a, uint64_t b, unsigned pred) {
+    sf_env e = sse_env(s);
+    sf_num x = sf_unpack(&SF_F64, a, &e), y = sf_unpack(&SF_F64, b, &e);
+    unsigned p = pred & 7;
+    sse_flags(s, sse_cmp_flags(&e, &x, &y, p == 1 || p == 2 || p == 5 || p == 6));
+    int c = sf_compare(&SF_F64, &x, &y), un = c == 2, r;
+    switch (p) {
+    case 0: r = c == 0; break;
+    case 1: r = !un && c < 0; break;
+    case 2: r = !un && c <= 0; break;
     case 3: r = un; break;
-    case 4: r = un || x != y; break;
-    case 5: r = un || !(x < y); break;
-    case 6: r = un || !(x <= y); break;
+    case 4: r = c != 0; break;
+    case 5: r = un || c >= 0; break;
+    case 6: r = un || c > 0; break;
     default: r = !un; break;
     }
     return r ? ~(uint64_t)0 : 0;
 }
 
-/* CVTTSD2SI: truncate; NaN or out of range -> integer indefinite. */
-static inline uint64_t sse_cvttsd2si(uint64_t b, unsigned bits) {
-    if (f64_isnan(b)) return bits == 64 ? I64_INDEFINITE : I32_INDEFINITE;
-    double x = f64_of(b);
-    if (bits == 64) {
-        /* trunc(x) fits in int64 iff -2^63 <= x < 2^63 (no double lies strictly
-         * between -2^63-1 and -2^63, both bounds are exact doubles). */
-        if (!(x >= -9223372036854775808.0 && x < 9223372036854775808.0)) return I64_INDEFINITE;
-        return (uint64_t)(int64_t)x;                   /* in range: C truncation is defined */
-    }
-    if (!(x > -2147483649.0 && x < 2147483648.0)) return I32_INDEFINITE;
-    return (uint32_t)(int32_t)x;
+/* Conversions */
+static inline uint64_t sse_to_int(x86_state *s, const sf_fmt *f, uint64_t b, unsigned bits, int truncate) {
+    sf_env e = sse_env(s); unsigned fl = 0;
+    uint64_t r = sf_to_int(f, &e, b, bits, truncate, &fl);
+    sse_flags(s, fl);
+    return r;
+}
+static inline uint64_t sse_cvttsd2si(x86_state *s, uint64_t b, unsigned bits) { return sse_to_int(s, &SF_F64, b, bits, 1); }
+static inline uint64_t sse_cvtsd2si(x86_state *s, uint64_t b, unsigned bits) { return sse_to_int(s, &SF_F64, b, bits, 0); }
+static inline uint64_t sse_cvtsi2sd(x86_state *s, uint64_t v, unsigned bits) {
+    sf_env e = sse_env(s); unsigned fl = 0;
+    uint64_t r = sf_from_int(&SF_F64, &e, (int64_t)x86_sext(v, bits), &fl);
+    sse_flags(s, fl);
+    return r;
+}
+static inline uint32_t sse_cvtsi2ss(x86_state *s, uint64_t v, unsigned bits) {
+    sf_env e = sse_env(s); unsigned fl = 0;
+    uint32_t r = (uint32_t)sf_from_int(&SF_F32, &e, (int64_t)x86_sext(v, bits), &fl);
+    sse_flags(s, fl);
+    return r;
+}
+static inline uint32_t sse_cvtsd2ss(x86_state *s, uint64_t b) {
+    sf_env e = sse_env(s); unsigned fl = 0;
+    uint32_t r = sf_f64_to_f32(&e, b, &fl);
+    sse_flags(s, fl);
+    return r;
+}
+static inline uint64_t sse_cvtss2sd(x86_state *s, uint32_t b) {
+    sf_env e = sse_env(s); unsigned fl = 0;
+    uint64_t r = sf_f32_to_f64(&e, b, &fl);
+    sse_flags(s, fl);
+    return r;
 }
 
-/* CVTSI2SD: signed integer -> double, rounded to nearest-even (exact for 32-bit). */
-static inline uint64_t sse_cvtsi2sd(uint64_t v, unsigned bits) {
-    int64_t i = (int64_t)x86_sext(v, bits);
-    return f64_bits((double)i);
-}
-
-/* CVTSD2SS / CVTSS2SD with explicit NaN handling (sign kept, payload
- * truncated/extended, quiet bit set) - identical on every host. */
-static inline uint32_t sse_cvtsd2ss(uint64_t b) {
-    if (f64_isnan(b))
-        return (uint32_t)((b >> 32) & 0x80000000u) | 0x7FC00000u | (uint32_t)((b >> 29) & 0x003FFFFFu);
-    return f32_bits((float)f64_of(b));                 /* RN; overflow -> inf; gradual underflow */
-}
-static inline uint64_t sse_cvtss2sd(uint32_t b) {
-    if (f32_isnan(b))
-        return ((uint64_t)(b & 0x80000000u) << 32) | 0x7FF8000000000000ull | ((uint64_t)(b & 0x003FFFFFu) << 29);
-    return f64_bits((double)f32_of(b));                /* exact */
+/* LDMXCSR / STMXCSR. Bits 16..31 are reserved: setting one is #GP. */
+static inline void sse_ldmxcsr(x86_state *s, uint32_t v) {
+    if (v & 0xFFFF0000u) exe2mac_raise(s, EXE2MAC_STATUS_ACCESS_VIOLATION_CODE, "ldmxcsr: reserved MXCSR bit set");
+    s->mxcsr = v;
 }
 
 /* 128-bit register helpers */

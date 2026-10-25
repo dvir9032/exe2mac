@@ -105,6 +105,26 @@ class CRuntimeSemanticsTests(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
             self.assertIn("failures=0", run.stdout)
 
+    def test_portable_mxcsr_vectors_recorded_from_hardware(self):
+        with tempfile.TemporaryDirectory() as td:
+            exe = os.path.join(td, "test_mxcsr")
+            r = _build_best("test_mxcsr.c", exe, ["-I", os.path.join(ROOT, "tests", "c")])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            run = subprocess.run([exe], capture_output=True, text=True, timeout=120)
+            self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+            self.assertIn("failures=0", run.stdout)
+
+    @unittest.skipUnless(platform.machine().lower() in ("x86_64", "amd64"),
+                         "differential oracle needs an x86-64 host CPU")
+    def test_mxcsr_differential_all_rounding_ftz_daz_settings(self):
+        with tempfile.TemporaryDirectory() as td:
+            exe = os.path.join(td, "diff_mxcsr")
+            r = _build_best("diff_mxcsr.c", exe, ["-mno-red-zone"])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            run = subprocess.run([exe], capture_output=True, text=True, timeout=1800)
+            self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+            self.assertIn("failures=0", run.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

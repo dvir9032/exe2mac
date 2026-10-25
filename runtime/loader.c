@@ -88,6 +88,7 @@ int exe2mac_load(x86_state *s, guest_mem *m, uint64_t base) {
     s->gpr[X86_RSP] = EXE2MAC_STACK_BASE + EXE2MAC_STACK_SIZE - 0x28;
     guest_st64(m, s->gpr[X86_RSP], EXE2MAC_EXIT_SENTINEL);
     s->df = 0;
+    s->mxcsr = 0x1F80u;                 /* Windows x64 default: all masked, round to nearest */
     g_exe2mac_base = base;
     s->rip = base + exe2mac_entry_rva;
     return 0;

@@ -113,6 +113,7 @@ class _FixtureE2E:
     EXIT = None
     ARGS = ()          # extra host argv -> Windows command line
     STDIN = None       # file under test/golden fed to standard input
+    STDERR_HAS = None  # expected diagnostic (fixtures that end in a guest fault)
 
     @property
     def EXE(self):
@@ -137,7 +138,10 @@ class _FixtureE2E:
         with open(self.GOLDEN, "rb") as f:
             golden = f.read()
         self.assertEqual(res.stdout, golden)
-        self.assertEqual(res.stderr, b"")
+        if self.STDERR_HAS is None:
+            self.assertEqual(res.stderr, b"")
+        else:
+            self.assertIn(self.STDERR_HAS, res.stderr)
         self.assertEqual(res.returncode, self.EXIT)
         self.assertEqual(res2.stdout, golden)
         self.assertEqual(res2.returncode, self.EXIT)
@@ -196,6 +200,15 @@ class TailEndToEndTests(_FixtureE2E, unittest.TestCase):
         from recompiler.translate import TranslationError, translate
         with self.assertRaisesRegex(TranslationError, "unresolved indirect jump"):
             translate(self.EXE, strict_indirect_jumps=True)
+
+
+@unittest.skipUnless(CC and dec.capstone is not None, "C compiler and capstone required")
+class MxcsrEndToEndTests(_FixtureE2E, unittest.TestCase):
+    """test/mxcsr.c: rounding control, FTZ, DAZ, sticky flags, cvtsd2si per mode,
+    then an unmasked divide-by-zero that ends the process with
+    STATUS_FLOAT_MULTIPLE_FAULTS (0xC00002B4 -> exit status 0xB4)."""
+    NAME, EXIT = "mxcsr", 0xB4
+    STDERR_HAS = b"0xc00002b4: unmasked SSE floating-point exception"
 
 
 @unittest.skipUnless(shutil.which("clang") and dec.capstone is not None, "clang and capstone required")

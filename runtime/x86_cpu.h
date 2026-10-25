@@ -34,7 +34,8 @@ typedef struct x86_state {
     uint64_t tail;           /* pending tail-call target (valid when tail_pending) */
     uint8_t tail_pending;    /* set by a translated tail jump, consumed by exe2mac_run_tail() */
     uint8_t cf, pf, af, zf, sf, of, df;
-    struct { uint64_t lo, hi; } xmm[16];   /* SSE registers (only moves are implemented) */
+    struct { uint64_t lo, hi; } xmm[16];   /* SSE registers */
+    uint32_t mxcsr;                        /* SSE control/status (default 0x1F80) */
     guest_mem *mem;
 } x86_state;
 

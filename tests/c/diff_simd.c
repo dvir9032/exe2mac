@@ -10,6 +10,9 @@ int main(void) { puts("SKIP: not an x86-64 host"); return 77; }
 
 #include "runtime/x86_simd.h"
 
+/* guest state with the Windows default MXCSR (0x1F80: all exceptions masked) */
+static x86_state G = { .mxcsr = 0x1F80u };
+
 static uint64_t rng = 0xb5ad4eceda1ce2a9ull;
 static uint64_t rnd(void) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; }
 static long cases, failures;
@@ -78,14 +81,14 @@ static void check(v128 a, v128 b) {
     CHECKV("unpckhpd", a, b, HW2("unpckhpd"), v_unpack(a, b, 64, 1));
     CHECKV("unpcklps", a, b, HW2("unpcklps"), v_unpack(a, b, 32, 0));
     CHECKV("unpckhps", a, b, HW2("unpckhps"), v_unpack(a, b, 32, 1));
-    CHECKV("addps", a, b, HW2("addps"), v_fp32(a, b, SSE_ADD));
-    CHECKV("subps", a, b, HW2("subps"), v_fp32(a, b, SSE_SUB));
-    CHECKV("mulps", a, b, HW2("mulps"), v_fp32(a, b, SSE_MUL));
-    CHECKV("divps", a, b, HW2("divps"), v_fp32(a, b, SSE_DIV));
-    CHECKV("addpd", a, b, HW2("addpd"), v_fp64(a, b, SSE_ADD));
-    CHECKV("subpd", a, b, HW2("subpd"), v_fp64(a, b, SSE_SUB));
-    CHECKV("mulpd", a, b, HW2("mulpd"), v_fp64(a, b, SSE_MUL));
-    CHECKV("divpd", a, b, HW2("divpd"), v_fp64(a, b, SSE_DIV));
+    CHECKV("addps", a, b, HW2("addps"), v_fp32(&G, a, b, SSE_ADD));
+    CHECKV("subps", a, b, HW2("subps"), v_fp32(&G, a, b, SSE_SUB));
+    CHECKV("mulps", a, b, HW2("mulps"), v_fp32(&G, a, b, SSE_MUL));
+    CHECKV("divps", a, b, HW2("divps"), v_fp32(&G, a, b, SSE_DIV));
+    CHECKV("addpd", a, b, HW2("addpd"), v_fp64(&G, a, b, SSE_ADD));
+    CHECKV("subpd", a, b, HW2("subpd"), v_fp64(&G, a, b, SSE_SUB));
+    CHECKV("mulpd", a, b, HW2("mulpd"), v_fp64(&G, a, b, SSE_MUL));
+    CHECKV("divpd", a, b, HW2("divpd"), v_fp64(&G, a, b, SSE_DIV));
 #define IMM(I) \
     CHECKV("pshufd" #I, a, b, HWI("pshufd $" #I), v_pshufd(b, I)); \
     CHECKV("pshuflw" #I, a, b, HWI("pshuflw $" #I), v_pshuflw(b, I)); \
@@ -130,9 +133,9 @@ static void check(v128 a, v128 b) {
     /* CVTSI2SS from 64- and 32-bit sources */
     uint32_t f;
     __asm__ volatile("cvtsi2ssq %1, %%xmm0; movd %%xmm0, %0" : "=r"(f) : "r"(a.lo) : "xmm0");
-    cases++; if (f != sse_cvtsi2ss(a.lo, 64)) report("cvtsi2ss64", a, b, (v128){f, 0}, (v128){sse_cvtsi2ss(a.lo, 64), 0});
+    cases++; if (f != sse_cvtsi2ss(&G, a.lo, 64)) report("cvtsi2ss64", a, b, (v128){f, 0}, (v128){sse_cvtsi2ss(&G, a.lo, 64), 0});
     __asm__ volatile("cvtsi2ssl %k1, %%xmm0; movd %%xmm0, %0" : "=r"(f) : "r"(a.lo) : "xmm0");
-    cases++; if (f != sse_cvtsi2ss(a.lo, 32)) report("cvtsi2ss32", a, b, (v128){f, 0}, (v128){sse_cvtsi2ss(a.lo, 32), 0});
+    cases++; if (f != sse_cvtsi2ss(&G, a.lo, 32)) report("cvtsi2ss32", a, b, (v128){f, 0}, (v128){sse_cvtsi2ss(&G, a.lo, 32), 0});
 }
 
 int main(void) {

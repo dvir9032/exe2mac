@@ -11,6 +11,9 @@ int main(void) { puts("SKIP: not an x86-64 host"); return 77; }
 
 #include "runtime/x86_sse.h"
 
+/* guest state with the Windows default MXCSR (0x1F80: all exceptions masked) */
+static x86_state G = { .mxcsr = 0x1F80u };
+
 static uint64_t rng = 0x243f6a8885a308d3ull;
 static uint64_t rnd(void) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; }
 
@@ -62,21 +65,21 @@ static uint32_t pick32(void) {
 
 static void check_f64(uint64_t a, uint64_t b) {
     uint64_t r;
-    HW2("addsd", a, b, r); CMP("addsd", a, b, r, sse_f64_arith(a, b, SSE_ADD));
-    HW2("subsd", a, b, r); CMP("subsd", a, b, r, sse_f64_arith(a, b, SSE_SUB));
-    HW2("mulsd", a, b, r); CMP("mulsd", a, b, r, sse_f64_arith(a, b, SSE_MUL));
-    HW2("divsd", a, b, r); CMP("divsd", a, b, r, sse_f64_arith(a, b, SSE_DIV));
-    HW2("maxsd", a, b, r); CMP("maxsd", a, b, r, sse_f64_max(a, b));
-    HW2("minsd", a, b, r); CMP("minsd", a, b, r, sse_f64_min(a, b));
+    HW2("addsd", a, b, r); CMP("addsd", a, b, r, sse_f64_arith(&G, a, b, SSE_ADD));
+    HW2("subsd", a, b, r); CMP("subsd", a, b, r, sse_f64_arith(&G, a, b, SSE_SUB));
+    HW2("mulsd", a, b, r); CMP("mulsd", a, b, r, sse_f64_arith(&G, a, b, SSE_MUL));
+    HW2("divsd", a, b, r); CMP("divsd", a, b, r, sse_f64_arith(&G, a, b, SSE_DIV));
+    HW2("maxsd", a, b, r); CMP("maxsd", a, b, r, sse_f64_max(&G, a, b));
+    HW2("minsd", a, b, r); CMP("minsd", a, b, r, sse_f64_min(&G, a, b));
     HW2("sqrtsd", a, b, r);                     /* xmm0 = sqrt(xmm1) */
-    CMP("sqrtsd", b, 0, r, sse_f64_sqrt(b));
-#define CMPSD(P) HW2("cmpsd $" #P ",", a, b, r); CMP("cmpsd" #P, a, b, r, sse_f64_cmp(a, b, P));
+    CMP("sqrtsd", b, 0, r, sse_f64_sqrt(&G, b));
+#define CMPSD(P) HW2("cmpsd $" #P ",", a, b, r); CMP("cmpsd" #P, a, b, r, sse_f64_cmp(&G, a, b, P));
     CMPSD(0) CMPSD(1) CMPSD(2) CMPSD(3) CMPSD(4) CMPSD(5) CMPSD(6) CMPSD(7)
     /* UCOMISD / COMISD flags */
     uint64_t f;
     __asm__ volatile("movq %1, %%xmm0; movq %2, %%xmm1; ucomisd %%xmm1, %%xmm0; pushfq; popq %0"
                      : "=r"(f) : "r"(a), "r"(b) : "xmm0", "xmm1", "cc");
-    x86_state s; memset(&s, 0, sizeof s); s.af = s.sf = s.of = 1;
+    x86_state s; memset(&s, 0, sizeof s); s.mxcsr = 0x1F80u; s.af = s.sf = s.of = 1;
     sse_f64_ucomi(&s, a, b);
     uint64_t mf = (uint64_t)s.cf | ((uint64_t)s.pf << 2) | ((uint64_t)s.af << 4) | ((uint64_t)s.zf << 6) |
                   ((uint64_t)s.sf << 7) | ((uint64_t)s.of << 11);
@@ -87,26 +90,26 @@ static void check_f64(uint64_t a, uint64_t b) {
     /* conversions from double */
     uint64_t i64; uint32_t i32;
     __asm__ volatile("movq %1, %%xmm0; cvttsd2si %%xmm0, %0" : "=r"(i64) : "r"(a) : "xmm0");
-    CMP("cvttsd2si64", a, 0, i64, sse_cvttsd2si(a, 64));
+    CMP("cvttsd2si64", a, 0, i64, sse_cvttsd2si(&G, a, 64));
     __asm__ volatile("movq %1, %%xmm0; cvttsd2si %%xmm0, %k0" : "=r"(i32) : "r"(a) : "xmm0");
-    CMP("cvttsd2si32", a, 0, i32, sse_cvttsd2si(a, 32));
+    CMP("cvttsd2si32", a, 0, i32, sse_cvttsd2si(&G, a, 32));
     __asm__ volatile("movq %1, %%xmm1; cvtsd2ss %%xmm1, %%xmm0; movd %%xmm0, %k0" : "=r"(i32) : "r"(a) : "xmm0", "xmm1");
-    CMP("cvtsd2ss", a, 0, i32, sse_cvtsd2ss(a));
+    CMP("cvtsd2ss", a, 0, i32, sse_cvtsd2ss(&G, a));
     /* integer -> double (use the raw random bits as the integer) */
     __asm__ volatile("cvtsi2sdq %1, %%xmm0; movq %%xmm0, %0" : "=r"(r) : "r"(b) : "xmm0");
-    CMP("cvtsi2sd64", b, 0, r, sse_cvtsi2sd(b, 64));
+    CMP("cvtsi2sd64", b, 0, r, sse_cvtsi2sd(&G, b, 64));
     __asm__ volatile("cvtsi2sdl %k1, %%xmm0; movq %%xmm0, %0" : "=r"(r) : "r"(b) : "xmm0");
-    CMP("cvtsi2sd32", b, 0, r, sse_cvtsi2sd(b, 32));
+    CMP("cvtsi2sd32", b, 0, r, sse_cvtsi2sd(&G, b, 32));
 }
 
 static void check_f32(uint32_t a, uint32_t b) {
     uint32_t r; uint64_t d;
-    HW2S("addss", a, b, r); CMP("addss", a, b, r, sse_f32_arith(a, b, SSE_ADD));
-    HW2S("subss", a, b, r); CMP("subss", a, b, r, sse_f32_arith(a, b, SSE_SUB));
-    HW2S("mulss", a, b, r); CMP("mulss", a, b, r, sse_f32_arith(a, b, SSE_MUL));
-    HW2S("divss", a, b, r); CMP("divss", a, b, r, sse_f32_arith(a, b, SSE_DIV));
+    HW2S("addss", a, b, r); CMP("addss", a, b, r, sse_f32_arith(&G, a, b, SSE_ADD));
+    HW2S("subss", a, b, r); CMP("subss", a, b, r, sse_f32_arith(&G, a, b, SSE_SUB));
+    HW2S("mulss", a, b, r); CMP("mulss", a, b, r, sse_f32_arith(&G, a, b, SSE_MUL));
+    HW2S("divss", a, b, r); CMP("divss", a, b, r, sse_f32_arith(&G, a, b, SSE_DIV));
     __asm__ volatile("movd %k1, %%xmm1; cvtss2sd %%xmm1, %%xmm0; movq %%xmm0, %0" : "=r"(d) : "r"(a) : "xmm0", "xmm1");
-    CMP("cvtss2sd", a, 0, d, sse_cvtss2sd(a));
+    CMP("cvtss2sd", a, 0, d, sse_cvtss2sd(&G, a));
 }
 
 int main(void) {
