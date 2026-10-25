@@ -16,8 +16,8 @@ Implement `exe2mac`: static recompilation of supported Windows PE32+ x86-64 prog
 ## Current repo state
 - Pipeline: `pe.py` → `decoder.py` (Capstone) → `cfg.py` → `lift_c.py` → host C compiler; CLI `python3 -m recompiler`.
 - Runtime: `runtime/` (see `runtime/README.md`); design and supported forms: `docs/TRANSLATION.md`.
-- `test/hello.exe` translates, builds and runs correctly on Linux x86-64 (stdout byte-identical, exit 7).
-  macOS ARM64 execution is still pending — see `STAGE3_STATUS.md`.
+- `test/hello.exe` translates, builds and runs correctly on Linux x86-64 and on macOS ARM64
+  (GitHub Actions macos-14, Apple M1): stdout byte-identical, exit 7 — see `STAGE3_STATUS.md`.
 - Tests: `python3 -m unittest discover -s tests -v` (74 tests in the prepared Linux environment).
 
 ## Definition of done for the first useful milestone

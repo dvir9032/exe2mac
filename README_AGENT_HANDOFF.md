@@ -15,8 +15,8 @@ python3 -m recompiler.analyze_cli test/hello.exe -o hello-analysis.json
 
 ## Current baseline in the prepared environment
 74 tests pass on Linux x86-64 (2026-10-25). `python3 -m recompiler run test/hello.exe --expect-stdout test/golden/hello.stdout --expect-exit 7`
-builds and executes the translated program on the current host. macOS ARM64 execution has not yet been performed;
-use `sh scripts/verify_macos_arm64.sh` on a Mac.
+builds and executes the translated program on the current host. Verified on macOS ARM64 via the
+`macos-arm64` GitHub Actions workflow (see `STAGE3_STATUS.md`); locally use `sh scripts/verify_macos_arm64.sh`.
 
 ## Prompt for regular status updates
 ```text
