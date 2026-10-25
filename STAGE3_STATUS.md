@@ -47,5 +47,12 @@ adc/sbb, not, setcc, xchg, rep stosb/movsb, movaps.
   (stdout byte-identical, exit 102, also when rebased)
 - Linux x86-64: 86 tests OK; differential test 5,807,808 cases, 0 failures
 
+## Jump tables — run 40184319064 (2026-10-25)
+Fixture `test/switch.exe` (two dense switches → jump tables of 12 and 7 entries,
+plus a sparse compare tree).
+- Windows reference: exit 50, stdout sha256 `80835fd5…` = golden (151 bytes)
+- macOS ARM64: 95 tests OK (1 x86-only skip), incl. switch end-to-end (exit 50, stdout identical)
+- Linux x86-64: 95 tests OK (1 macOS-only skip)
+
 ## Not implemented
 See "Limitations" in `docs/TRANSLATION.md`. 

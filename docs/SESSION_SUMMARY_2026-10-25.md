@@ -69,6 +69,12 @@ executables (no Wine, no CPU emulation at run time). First fixture:
     (one formatting slip in the model fixed after comparison; all values matched),
     then confirmed by the Windows CI run (exit 102, identical sha256).
 
+11. **Jump tables.** `cfg.py` recognises the bounded relative-offset switch
+    idiom symbolically (count from `cmp`/`ja`, post-check that nothing bypasses
+    the guard); the lifter runs the real table load and switches over proven
+    targets, faulting otherwise. Fixture `test/switch.exe` (exit 50) matches its
+    model and the Windows run; 95 tests pass on Linux and macOS ARM64.
+
 ## Open items / caveats
 - Golden output now confirmed on Windows (see `test/golden/README.md`).
 - Undefined x86 flags are left unchanged (a legal outcome).
@@ -84,5 +90,5 @@ limitations), `docs/DECODER_CFG.md`, `runtime/README.md`,
 Remill Apache-2.0 used only as architectural references, no code copied).
 
 ## Next step
-Jump tables (indirect `jmp` through a table in .rdata, emitted for dense
-`switch` statements) — currently rejected by the CFG.
+Options: scalar SSE floating point (movsd/addsd/cvt*, needed by most real
+programs), more kernel32 imports, or tail calls between functions.
