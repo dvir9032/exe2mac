@@ -325,8 +325,8 @@ class FailClosedLifterTests(unittest.TestCase):
         self.assertRejected("0f5dc1c3", "register xmm0 is not supported")       # minps (not implemented)
 
     def test_unliftable_code_pointer_candidate_is_left_out_and_faults_if_called(self):
-        # lea rax, [rip + 3] ; call rax ; ret ; cpuid ; ret
-        code = "488d0503000000" "ffd0" "c3" "0fa2" "c3"
+        # lea rax, [rip + 3] ; call rax ; ret ; pcmpistri xmm0, xmm1, 0xc (not implemented) ; ret
+        code = "488d0503000000" "ffd0" "c3" "660f3a63c10c" "c3"
         src = self.lift(code)
         self.assertIn("candidate code pointer 0x14000100a not translated", src)
         self.assertNotIn("case 0x100aull", src)
