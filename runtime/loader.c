@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "exe2mac_rt.h"
+#include "process.h"
 
 uint64_t g_exe2mac_base;
 
@@ -36,6 +37,10 @@ int exe2mac_load(x86_state *s, guest_mem *m, uint64_t base) {
         return fail("image overlaps guest stack", base);
     if (overlaps(base, size, EXE2MAC_THUNK_BASE, 0x100000000ull))
         return fail("image overlaps thunk window", base);
+    if (overlaps(base, size, EXE2MAC_HEAP_BASE, EXE2MAC_HEAP_SIZE))
+        return fail("image overlaps the guest heap", base);
+    if (overlaps(base, size, EXE2MAC_VALLOC_BASE, EXE2MAC_VALLOC_LIMIT - EXE2MAC_VALLOC_BASE))
+        return fail("image overlaps the VirtualAlloc window", base);
 
     uint8_t *img = malloc(size);
     if (!img) return fail("out of memory", size);

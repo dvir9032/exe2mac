@@ -20,7 +20,8 @@ from .lift_c import TranslationError as _LiftError, lift_program
 from .pe import PE
 
 ROOT = Path(__file__).resolve().parent.parent
-RUNTIME_SOURCES = ["loader.c", "dispatch.c", "winapi_bridge.c", "winapi_shims.c", "guest_mem.c", "fault.c", "main.c"]
+RUNTIME_SOURCES = ["loader.c", "dispatch.c", "winapi_bridge.c", "winapi_shims.c", "process.c", "guest_heap.c",
+                   "guest_mem.c", "fault.c", "main.c"]
 
 # Instructions observed in the supplied hello.exe (linear sweep). Kept for
 # reference; the real work list is the reachable set computed by cfg.discover.

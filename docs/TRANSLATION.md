@@ -77,7 +77,13 @@ RAX and performs the guest `ret`.
 | Import | Behaviour |
 |---|---|
 | `GetStdHandle(DWORD)` | −10/−11/−12 → biased handle 0x1000+fd; other → INVALID_HANDLE_VALUE |
-| `WriteFile(h, buf, DWORD, LPDWORD, LPOVERLAPPED)` | writes `buf[0..n)` to the fd; stores bytes written; non-NULL OVERLAPPED faults (unsupported) |
+| `WriteFile(h, buf, DWORD, LPDWORD, LPOVERLAPPED)` | writes `buf[0..n)`; zeroes then stores bytes written; bad handle → FALSE + `ERROR_INVALID_HANDLE`; non-NULL OVERLAPPED faults |
+| `ReadFile(h, buf, DWORD, LPDWORD, LPOVERLAPPED)` | standard input only; reads until the buffer is full or end of input (file semantics), TRUE with 0 bytes at EOF; other handles → FALSE + `ERROR_INVALID_HANDLE` |
+| `GetCommandLineA()` | guest string built once from the host argv with the Windows quoting rules (inverse of `CommandLineToArgvW`); bytes passed through unchanged (ANSI) |
+| `GetLastError()` / `SetLastError(DWORD)` | one per-process value (single-threaded guest) |
+| `GetProcessHeap()` | handle 0x20000000 |
+| `HeapAlloc` / `HeapReAlloc` / `HeapFree` | first-fit allocator over a 64 MiB guest region; 16-byte aligned; `HEAP_ZERO_MEMORY` (realloc zeroes beyond the previous request); metadata kept on the host so guest writes cannot corrupt it; bad free → FALSE + `ERROR_INVALID_PARAMETER`; other heaps / `HEAP_GENERATE_EXCEPTIONS` / `HEAP_REALLOC_IN_PLACE_ONLY` fault |
+| `VirtualAlloc` / `VirtualFree` | `lpAddress == NULL`, `MEM_COMMIT\|MEM_RESERVE` (± `MEM_TOP_DOWN`), `PAGE_READWRITE`/`PAGE_READONLY` → zeroed, 64 KiB-aligned guest region; `MEM_RELEASE` of a whole region; other forms fault |
 | `ExitProcess(UINT)` | `exit(code & 0xff)` (POSIX keeps 8 bits) |
 
 Any other import is rejected at translation time and at load time.
@@ -85,11 +91,12 @@ Any other import is rejected at translation time and at load time.
 ## Supported instruction forms
 Implemented exactly (defined flags computed; undefined flags left unchanged):
 
-* data movement: `mov`/`movabs` (same width), `movsxd r64, r/m32`,
+* data movement: `mov`/`movabs` (same width), `movsxd r64, r/m32`, `cdqe cwde`,
   `movzx`/`movsx` (r16/32/64 ← r/m8/16), `lea r16/32/64`, `xchg r, r/m`,
   `push r/m64/imm`, `pop r64`, `cmovcc` (all 16), `setcc r/m8` (all 16)
 * arithmetic/logic: `add sub adc sbb and or xor` (r/m, r/m/imm), `cmp test`,
-  `inc dec neg not`, `shl/sal shr sar` (imm8 or CL), `mul r/m32|64`,
+  `inc dec neg not`, `shl/sal shr sar` (imm8 or CL), `bt` (register or
+  immediate offset; a memory bit string with a register offset is rejected), `mul r/m32|64`,
   `imul r, r/m` / `imul r, r/m, imm`, `div`/`idiv r/m32|64`
   (#DE → 0xC0000094 / 0xC0000095), `cdq cqo`
 * strings: `rep stosb`, `rep movsb` (byte-exact, honours DF, overlap-safe)
@@ -111,7 +118,8 @@ Implemented exactly (defined flags computed; undefined flags left unchanged):
   `nop` (any form; never touches memory)
 
 Rejected with `TranslationError` (address + bytes in the message): anything else
-(e.g. `bt`, `rol/ror`, packed SSE arithmetic, x87, `rep stosd`, `repne scasb`),
+(e.g. `rol/ror`, packed SSE arithmetic such as `punpcklbw`/`addps` — so
+auto-vectorised code is not yet supported —, x87, `rep stosd`, `repne scasb`),
 LOCK prefixes, address-size override, FS/GS segment overrides, absolute
 `[disp32]` operands, one-operand `imul`, `ret imm16`, indirect `jmp` other than
 recognised jump tables,
@@ -124,6 +132,7 @@ unsupported imports, code relocations.
 | `test/ops.exe` | `sh scripts/build_fixture.sh test/ops.c test/ops.exe` (clang + lld-link, -O2) | exit 102 | `test/golden/ops_model.py` (independent Python model of the C semantics) + Windows CI job |
 | `test/switch.exe` | `sh scripts/build_fixture.sh test/switch.c test/switch.exe` | exit 50 | `test/golden/switch_model.py` + Windows CI job |
 | `test/fp.exe` | `EXTRA_CFLAGS=-fno-math-errno sh scripts/build_fixture.sh test/fp.c test/fp.exe` | exit 27 | `test/golden/fp_model.py` (SDM NaN rules) + Windows CI job |
+| `test/io.exe` | `EXTRA_CFLAGS="-fno-vectorize -fno-slp-vectorize" sh scripts/build_fixture.sh test/io.c test/io.exe` | exit 5 with args `alpha "b c" q\"uote "back\slash\\" ""` and stdin `test/golden/io.input` | `test/golden/io_model.py` + Windows CI job via `test/io.windows.bat` |
 
 ## Verification
 * `tests/c/test_cpu.c`: SDM-derived expected values for every helper (any host).

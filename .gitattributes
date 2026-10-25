@@ -2,3 +2,4 @@
 test/golden/* -text
 *.exe binary
 *.obj binary
+*.bat text eol=crlf

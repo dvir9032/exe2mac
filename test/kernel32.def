@@ -4,3 +4,13 @@ GetStdHandle
 WriteFile
 ExitProcess
 GetTickCount
+ReadFile
+GetCommandLineA
+GetProcessHeap
+HeapAlloc
+HeapReAlloc
+HeapFree
+VirtualAlloc
+VirtualFree
+GetLastError
+SetLastError

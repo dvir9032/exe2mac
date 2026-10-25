@@ -1,0 +1,6 @@
+args: [alpha] [b c] [q"uote] [back\slash\] []
+stdin: bytes=44 lines=4 words=8 hash=1459480146
+reversed first line: dlrow olleh
+heap: zeroed=1 aligned16=1 distinct=1 free=1
+virtual: ok=1 aligned64k=1 zeroed=1 last=90 release=1
+lasterror: set=1234 badwrite=0 err=6 written=0

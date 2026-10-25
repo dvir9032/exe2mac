@@ -8,9 +8,10 @@
 #include <stdlib.h>
 
 #include "exe2mac_rt.h"
+#include "process.h"
 #include "winapi_shims.h"
 
-int main(void) {
+int main(int argc, char **argv) {
     static x86_state s;
     static guest_mem m;
     uint64_t base = exe2mac_preferred_base;
@@ -24,6 +25,7 @@ int main(void) {
         }
     }
     if (exe2mac_load(&s, &m, base) != 0) return 125;
+    if (exe2mac_process_init(&m, argc, argv) != 0) return 125;
 
     exe2mac_dispatch(&s, s.rip);
     if (s.rip != EXE2MAC_EXIT_SENTINEL) exe2mac_bad_return(&s, EXE2MAC_EXIT_SENTINEL);

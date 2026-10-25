@@ -74,6 +74,17 @@ class CRuntimeSemanticsTests(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
             self.assertIn("failures=0", run.stdout)
 
+    def test_guest_heap_and_command_line_quoting(self):
+        with tempfile.TemporaryDirectory() as td:
+            exe = os.path.join(td, "test_heap")
+            extra = ["-I", os.path.join(ROOT, "runtime"),
+                     os.path.join(ROOT, "runtime", "process.c"), os.path.join(ROOT, "runtime", "guest_heap.c")]
+            r = _build_best("test_heap.c", exe, extra)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            run = subprocess.run([exe], capture_output=True, text=True, timeout=120)
+            self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+            self.assertIn("failures=0", run.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

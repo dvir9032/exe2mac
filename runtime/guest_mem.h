@@ -21,7 +21,7 @@ extern "C" {
 
 #define GUEST_PERM_R 1u
 #define GUEST_PERM_W 2u
-#define GUEST_MAX_REGIONS 16
+#define GUEST_MAX_REGIONS 64
 
 typedef struct guest_region {
     uint64_t base;
@@ -38,6 +38,9 @@ typedef struct guest_mem {
 
 /* Returns 0 on success, -1 if the region overlaps another, wraps, or the table is full. */
 int guest_map(guest_mem *m, uint64_t base, uint64_t size, uint8_t *host, unsigned perms, const char *name);
+
+/* Removes the region that starts exactly at `base`. Returns 0, or -1 if none. */
+int guest_unmap(guest_mem *m, uint64_t base);
 
 /* Bounds- and permission-checked translation. Faults (does not return) on failure. */
 uint8_t *guest_ptr(guest_mem *m, uint64_t va, uint64_t len, unsigned need);

@@ -369,6 +369,25 @@ static void test_movaps(void) {
 static void movaps_misaligned(void) { x86_state s = string_state(); x86_ld128(&s, 0, 0x5008, 1); }
 static void movaps_partial_oob(void) { x86_state s = string_state(); x86_st128(&s, 0, 0x5030 + 0x10 - 8, 0); }
 
+static void test_cdqe_cwde(void) {
+    x86_state s = fresh();
+    s.gpr[X86_RAX] = 0x12345678fffffff9ull; x86_cdqe(&s); EQ(s.gpr[X86_RAX], 0xfffffffffffffff9ull);
+    s.gpr[X86_RAX] = 0xffffffff7fffffffull; x86_cdqe(&s); EQ(s.gpr[X86_RAX], 0x7fffffffull);
+    s.gpr[X86_RAX] = 0x123456789abc8001ull; x86_cwde(&s); EQ(s.gpr[X86_RAX], 0xffff8001ull);
+    s.gpr[X86_RAX] = 0xffffffffffff7fffull; x86_cwde(&s); EQ(s.gpr[X86_RAX], 0x7fffull);
+}
+
+static void test_bt(void) {
+    x86_state s = fresh();
+    s.zf = 1;
+    x86_bt(&s, 0x100002600ull, 9, 64);   EQ(s.cf, 1); EQ(s.zf, 1);
+    x86_bt(&s, 0x100002600ull, 8, 64);   EQ(s.cf, 0);
+    x86_bt(&s, 0x100002600ull, 32, 64);  EQ(s.cf, 1);
+    x86_bt(&s, 0x100002600ull, 96, 64);  EQ(s.cf, 1);    /* 96 & 63 == 32 */
+    x86_bt(&s, 0x80000000u, 63, 32);     EQ(s.cf, 1);    /* 63 & 31 == 31 */
+    x86_bt(&s, 0x8000u, 31, 16);         EQ(s.cf, 1);    /* 31 & 15 == 15 */
+}
+
 static void test_new_faults(void) {
     EQ(child_status(udiv_zero), 0x94);
     EQ(child_status(udiv_overflow), 0x95);
@@ -395,6 +414,8 @@ int main(void) {
     test_div();
     test_string_ops();
     test_movaps();
+    test_bt();
+    test_cdqe_cwde();
     test_new_faults();
     printf("checks=%d failures=%d\n", checks, failures);
     return failures ? 1 : 0;

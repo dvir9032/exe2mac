@@ -19,7 +19,8 @@ from fake_pe import BASE, FakePE  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 CC = os.environ.get("CC") or shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
-RUNTIME = ["loader.c", "dispatch.c", "winapi_bridge.c", "winapi_shims.c", "guest_mem.c", "fault.c"]
+RUNTIME = ["loader.c", "dispatch.c", "winapi_bridge.c", "winapi_shims.c", "process.c", "guest_heap.c",
+           "guest_mem.c", "fault.c"]
 
 REGS = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
         "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
@@ -259,7 +260,7 @@ class FailClosedLifterTests(unittest.TestCase):
             self.lift(code_hex, **kw)
 
     def test_unsupported_instruction(self):
-        self.assertRejected("480fa3c8c3", "unsupported instruction.*bt")         # bt rax, rcx
+        self.assertRejected("480fa308c3", "memory bit string")                  # bt [rax], rcx
         self.assertRejected("48d1c0c3", "unsupported instruction.*rol")          # rol rax, 1
         self.assertRejected("0f58c1c3", "register xmm0 is not supported")       # addps (packed single)
 

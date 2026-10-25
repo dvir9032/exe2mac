@@ -134,6 +134,16 @@ static void hw_div(unsigned bits, uint64_t rax, uint64_t rdx, uint64_t src, uint
     *orax = a; *ordx = d;
 }
 
+static uint64_t hw_bt(unsigned bits, uint64_t a, uint64_t b, uint64_t fin) {
+    uint64_t f;
+    switch (bits) {
+    case 16: __asm__ volatile("pushq %3; popfq; btw %w2, %w1; pushfq; popq %0" : "=r"(f) : "r"(a), "r"(b), "r"(fin) : "cc"); break;
+    case 32: __asm__ volatile("pushq %3; popfq; btl %k2, %k1; pushfq; popq %0" : "=r"(f) : "r"(a), "r"(b), "r"(fin) : "cc"); break;
+    default: __asm__ volatile("pushq %3; popfq; btq %2, %1; pushfq; popq %0"   : "=r"(f) : "r"(a), "r"(b), "r"(fin) : "cc"); break;
+    }
+    return f;
+}
+
 static uint64_t hw_imul2(unsigned bits, uint64_t a, uint64_t b, uint64_t fin, uint64_t *fout) {
     uint64_t x = a, f;
     switch (bits) {
@@ -233,6 +243,11 @@ static void check_pair(uint64_t a, uint64_t b, uint64_t fin) {
             cmp_result("sar", bits, A, c, fin, hr, hf, mr, &s, mask);
         }
         if (bits >= 16) {
+            /* BT reg, reg: CF from the selected bit, ZF must be unchanged */
+            load_flags(&s, fin);
+            hf = hw_bt(bits, A, B, fin);
+            x86_bt(&s, A, B, bits);
+            cmp_result("bt", bits, A, B, fin, 0, hf, 0, &s, F_CF | F_ZF);
             load_flags(&s, fin);
             hr = hw_imul2(bits, A, B, fin, &hf);
             mr = x86_imul2(&s, A, B, bits);
@@ -291,6 +306,14 @@ static void check_pair(uint64_t a, uint64_t b, uint64_t fin) {
                     if (orax != s.gpr[X86_RAX] || ordx != s.gpr[X86_RDX])
                         report("div", bits, a, b, rdx_u, orax, s.gpr[X86_RAX], ordx, s.gpr[X86_RDX], 0);
                 }
+            }
+            /* CDQE / CWDE */
+            {
+                uint64_t ra = a;
+                if (bits == 32) { __asm__ volatile("cltq" : "+a"(ra)); s.gpr[X86_RAX] = a; x86_cdqe(&s); }
+                else            { __asm__ volatile("cwtl" : "+a"(ra)); s.gpr[X86_RAX] = a; x86_cwde(&s); }
+                cases++;
+                if (ra != s.gpr[X86_RAX]) report(bits == 32 ? "cdqe" : "cwde", bits, a, 0, 0, ra, s.gpr[X86_RAX], 0, 0, 0);
             }
             /* CDQ / CQO */
             uint64_t ca = a, cd = 0x1234567812345678ull;

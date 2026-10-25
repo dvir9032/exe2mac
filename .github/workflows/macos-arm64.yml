@@ -120,10 +120,14 @@ jobs:
         run: |
           ver="$(cmd.exe //c ver | tr -d '\r' | tr -s '\n' ' ')"
           status=0
-          for spec in hello:7 ops:102 switch:50 fp:27; do
+          for spec in hello:7 ops:102 switch:50 fp:27 io:5; do
             name=${spec%%:*}; want=${spec##*:}
             set +e
-            ./test/$name.exe > $name.win.stdout 2> $name.win.stderr
+            if [ -f test/$name.windows.bat ]; then
+              cmd.exe //c "test\\$name.windows.bat"       # exact command line + stdin redirection
+            else
+              ./test/$name.exe > $name.win.stdout 2> $name.win.stderr
+            fi
             code=$?
             set -e
             h_win=$(sha256sum < $name.win.stdout | cut -d' ' -f1)

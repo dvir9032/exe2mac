@@ -8,7 +8,10 @@
 | `exe2mac_rt.h` | interface between generated code and the runtime |
 | `loader.c` | maps the image, applies relocations, binds the IAT, sets up the guest stack |
 | `dispatch.c` | indirect-call targets outside translated code (import thunks), return-address checks |
-| `winapi_bridge.c` | Windows x64 ABI → host bridges for GetStdHandle / WriteFile / ExitProcess |
+| `winapi_bridge.c` | Windows x64 ABI → host bridges for the supported kernel32 imports (see `docs/TRANSLATION.md`) |
+| `process.h/.c` | process heap, command line (Windows quoting), last-error value, VirtualAlloc regions |
+| `guest_heap.h/.c` | first-fit allocator for the guest heap (host-side metadata) |
+| `x86_sse.h` | scalar SSE/SSE2 semantics (bit-exact, x86 NaN rules) |
 | `winapi_shims.c/.h` | host POSIX implementations used by the bridges |
 | `main.c` | process start-up for a translated program |
 

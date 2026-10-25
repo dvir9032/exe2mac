@@ -4,11 +4,13 @@
 #include <stdio.h>
 
 #include "runtime/exe2mac_rt.h"
+#include "runtime/process.h"
 
-int main(void) {
+int main(int argc, char **argv) {
     static x86_state s;
     static guest_mem m;
     if (exe2mac_load(&s, &m, exe2mac_preferred_base) != 0) return 125;
+    if (exe2mac_process_init(&m, argc, argv) != 0) return 125;
     uint64_t rsp0 = s.gpr[X86_RSP];
     exe2mac_dispatch(&s, s.rip);
     if (s.rip != EXE2MAC_EXIT_SENTINEL) exe2mac_bad_return(&s, EXE2MAC_EXIT_SENTINEL);

@@ -111,6 +111,8 @@ class _FixtureE2E:
 
     NAME = None
     EXIT = None
+    ARGS = ()          # extra host argv -> Windows command line
+    STDIN = None       # file under test/golden fed to standard input
 
     @property
     def EXE(self):
@@ -124,8 +126,13 @@ class _FixtureE2E:
         from recompiler.translate import build
         with tempfile.TemporaryDirectory() as td:
             exe = build(self.EXE, os.path.join(td, self.NAME))
-            res = subprocess.run([str(exe)], capture_output=True, timeout=60)
-            res2 = subprocess.run([str(exe)], capture_output=True, timeout=60,
+            stdin = b""
+            if self.STDIN:
+                with open(os.path.join(ROOT, "test", "golden", self.STDIN), "rb") as f:
+                    stdin = f.read()
+            argv = [str(exe), *self.ARGS]
+            res = subprocess.run(argv, capture_output=True, timeout=60, input=stdin)
+            res2 = subprocess.run(argv, capture_output=True, timeout=60, input=stdin,
                                   env=dict(os.environ, EXE2MAC_IMAGE_BASE="7ff6a0000000"))
         with open(self.GOLDEN, "rb") as f:
             golden = f.read()
@@ -160,6 +167,15 @@ class FpEndToEndTests(_FixtureE2E, unittest.TestCase):
     """test/fp.c: scalar SSE double/float arithmetic, sqrt, min/max, compares,
     conversions; results printed as exact IEEE-754 bit patterns."""
     NAME, EXIT = "fp", 27
+
+
+@unittest.skipUnless(CC and dec.capstone is not None, "C compiler and capstone required")
+class IoEndToEndTests(_FixtureE2E, unittest.TestCase):
+    """test/io.c: ReadFile(stdin), GetCommandLineA, process heap, VirtualAlloc,
+    GetLastError/SetLastError. Same arguments and input as test/io.windows.bat."""
+    NAME, EXIT = "io", 5
+    ARGS = ("alpha", "b c", 'q"uote', "back\\slash\\", "")
+    STDIN = "io.input"
 
 
 @unittest.skipUnless(shutil.which("clang") and dec.capstone is not None, "clang and capstone required")

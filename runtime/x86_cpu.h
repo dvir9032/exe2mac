@@ -186,6 +186,14 @@ static inline uint64_t x86_sbb(x86_state *s, uint64_t a, uint64_t b, unsigned bi
     return r;
 }
 
+/* BT with a register operand or an immediate offset: the offset is taken
+ * modulo the operand width. CF = selected bit; ZF unchanged; OF/SF/AF/PF
+ * undefined (unchanged). (Memory operands with a register offset address a
+ * bit string beyond the operand and are rejected by the lifter.) */
+static inline void x86_bt(x86_state *s, uint64_t a, uint64_t off, unsigned bits) {
+    s->cf = (uint8_t)((a >> (off & (bits - 1))) & 1);
+}
+
 /* NOT: no flags. */
 static inline uint64_t x86_not(uint64_t a, unsigned bits) { return ~a & x86_mask(bits); }
 
@@ -375,6 +383,9 @@ static inline void x86_st128(x86_state *s, int x, uint64_t va, int aligned) {
 static inline void x86_cdq(x86_state *s) {
     x86_set(s, X86_RDX, 32, 0, x86_msb(s->gpr[X86_RAX], 32) ? 0xffffffffu : 0);
 }
+/* CDQE: RAX = sign-extend(EAX). CWDE: EAX = sign-extend(AX), zero-extending RAX. No flags. */
+static inline void x86_cdqe(x86_state *s) { s->gpr[X86_RAX] = x86_sext(s->gpr[X86_RAX], 32); }
+static inline void x86_cwde(x86_state *s) { x86_set(s, X86_RAX, 32, 0, x86_sext(s->gpr[X86_RAX], 16)); }
 static inline void x86_cqo(x86_state *s) {
     s->gpr[X86_RDX] = x86_msb(s->gpr[X86_RAX], 64) ? ~(uint64_t)0 : 0;
 }

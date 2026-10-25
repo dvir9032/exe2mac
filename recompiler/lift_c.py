@@ -23,11 +23,11 @@ from .decoder import Instruction, Operand
 
 M64 = (1 << 64) - 1
 
-SUPPORTED_IMPORTS = frozenset({
-    ("kernel32.dll", "ExitProcess"),
-    ("kernel32.dll", "GetStdHandle"),
-    ("kernel32.dll", "WriteFile"),
-})
+SUPPORTED_IMPORTS = frozenset(("kernel32.dll", n) for n in (
+    "ExitProcess", "GetStdHandle", "WriteFile", "ReadFile", "GetCommandLineA",
+    "GetLastError", "SetLastError", "GetProcessHeap", "HeapAlloc", "HeapReAlloc",
+    "HeapFree", "VirtualAlloc", "VirtualFree",
+))
 
 COND = {"o": 0, "no": 1, "b": 2, "ae": 3, "e": 4, "ne": 5, "be": 6, "a": 7,
         "s": 8, "ns": 9, "p": 10, "np": 11, "l": 12, "ge": 13, "le": 14, "g": 15}
@@ -256,6 +256,14 @@ class Lifter:
             e = with_ea(dst)
             f.emit(f"t = {SHIFTS[mn]}(s, {f.read(dst, e)}, {f.read(cnt)}, {dst.bits});")
             f.emit(f.write(dst, "t", e))
+        elif mn == "bt":
+            base, off = f.need(2)
+            if base.size not in (2, 4, 8) or off.kind == "mem" or (off.kind == "reg" and off.size != base.size):
+                raise _err(insn, "invalid bt form")
+            if base.kind == "mem" and off.kind != "imm":
+                raise _err(insn, "bt with a memory bit string and register offset is not supported")
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            f.emit(f"x86_bt(s, {f.read(base)}, {f.read(off)}, {base.bits});")
         elif mn in ("movzx", "movsx"):
             dst, src = f.need(2)
             if dst.kind != "reg" or dst.size not in (2, 4, 8) or src.size not in (1, 2) or src.size >= dst.size:
@@ -324,6 +332,9 @@ class Lifter:
         elif mn == "cqo":
             f.need(0)
             f.emit("x86_cqo(s);")
+        elif mn in ("cdqe", "cwde"):
+            f.need(0)
+            f.emit(f"x86_{mn}(s);")
         elif mn.startswith("cmov") and mn[4:] in COND:
             dst, src = f.need(2)
             if dst.kind != "reg" or dst.size not in (2, 4, 8) or src.size != dst.size:

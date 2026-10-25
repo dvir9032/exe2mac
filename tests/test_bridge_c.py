@@ -7,7 +7,7 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 CC = os.environ.get("CC") or shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
-SRCS = ["dispatch.c", "winapi_bridge.c", "winapi_shims.c", "guest_mem.c", "fault.c"]
+SRCS = ["dispatch.c", "winapi_bridge.c", "winapi_shims.c", "process.c", "guest_heap.c", "guest_mem.c", "fault.c"]
 
 
 @unittest.skipUnless(CC, "a C compiler is required")
@@ -24,7 +24,7 @@ class BridgeTests(unittest.TestCase):
             if r.returncode:
                 r = subprocess.run(base, capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)
-            run = subprocess.run([exe], capture_output=True, timeout=60)
+            run = subprocess.run([exe], capture_output=True, timeout=60, input=b"bridge-input")
         self.assertEqual(run.returncode, 0, run.stderr.decode(errors="replace"))
         self.assertEqual(run.stdout, b"bridge-ok\n")
         self.assertIn(b"failures=0", run.stderr)

@@ -15,6 +15,16 @@ int guest_map(guest_mem *m, uint64_t base, uint64_t size, uint8_t *host, unsigne
     return 0;
 }
 
+int guest_unmap(guest_mem *m, uint64_t base) {
+    for (int i = 0; i < m->n; i++) {
+        if (m->r[i].base == base) {
+            m->r[i] = m->r[--m->n];
+            return 0;
+        }
+    }
+    return -1;
+}
+
 uint8_t *guest_try_ptr(guest_mem *m, uint64_t va, uint64_t len, unsigned need) {
     if (len == 0) len = 1;                      /* a zero-length access still needs a valid address */
     if (va + len - 1 < va) return NULL;         /* wraps */
