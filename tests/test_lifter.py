@@ -28,14 +28,14 @@ STACK_TOP = 0x10000000 + 0x100000
 RSP0 = STACK_TOP - 0x28
 
 
-def build_snippet(code_hex, td, imports=(), rdata=b"", data=b""):
+def build_snippet(code_hex, td, imports=(), rdata=b"", data=b"", trap_unsupported=False):
     from recompiler.lift_c import Lifter
     from recompiler.cfg import discover
     pe = FakePE(bytes.fromhex(code_hex), rdata=rdata, imports=imports, data=data)
     c = os.path.join(td, "snip.gen.c")
     exe = os.path.join(td, "snip")
     with open(c, "w") as f:
-        f.write(Lifter(pe, discover(pe)).emit())
+        f.write(Lifter(pe, discover(pe), trap_unsupported=trap_unsupported).emit())
     cmd = [CC, "-std=c11", "-D_DEFAULT_SOURCE", "-O1", "-Wall", "-Wextra", "-Werror", "-ffp-contract=off",
            "-I", ROOT, "-I", os.path.join(ROOT, "runtime"), c,
            os.path.join(ROOT, "tests", "c", "snippet_main.c"),
@@ -46,9 +46,9 @@ def build_snippet(code_hex, td, imports=(), rdata=b"", data=b""):
     return exe
 
 
-def snippet_exit_status(code_hex, data=b""):
+def snippet_exit_status(code_hex, data=b"", trap_unsupported=False):
     with tempfile.TemporaryDirectory() as td:
-        exe = build_snippet(code_hex, td, data=data)
+        exe = build_snippet(code_hex, td, data=data, trap_unsupported=trap_unsupported)
         return subprocess.run([exe], capture_output=True, timeout=30)
 
 
@@ -373,3 +373,64 @@ class FailClosedLifterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(CC and dec.capstone is not None, "C compiler and capstone required")
+class TrapInstructionTests(unittest.TestCase):
+    """Instructions that raise an exception end the process with its status
+    (no SEH yet); the POSIX exit status is the low byte."""
+
+    def check(self, code_hex, status, text):
+        r = snippet_exit_status(code_hex)
+        self.assertEqual(r.returncode, status & 0xFF)
+        self.assertIn(f"0x{status:08x}".encode(), r.stderr)
+        self.assertIn(text.encode(), r.stderr)
+
+    def test_int3_is_breakpoint(self):
+        self.check("b801000000cc", 0x80000003, "int3: breakpoint")        # mov eax,1; int3
+
+    def test_ud2_is_illegal_instruction(self):
+        self.check("0f0b", 0xC000001D, "ud2: illegal instruction")
+
+    def test_fastfail_is_stack_buffer_overrun(self):
+        self.check("b907000000cd29", 0xC0000409, "__fastfail")           # mov ecx,7; int 0x29
+
+    def test_other_int_is_rejected(self):
+        from recompiler.lift_c import TranslationError
+        with self.assertRaisesRegex(TranslationError, "unsupported instruction"):
+            snippet_exit_status("cd80")                                   # int 0x80
+
+    def test_xgetbv_is_ud_because_osxsave_is_clear(self):
+        r = snippet_exit_status("31c90f01d0c3")                           # xor ecx,ecx; xgetbv; ret
+        self.assertEqual(r.returncode, 0x1D)
+        self.assertIn(b"OSXSAVE = 0", r.stderr)
+
+    def test_unimplemented_instruction_strict_by_default(self):
+        from recompiler.lift_c import TranslationError
+        with self.assertRaisesRegex(TranslationError, "pcmpistri"):
+            snippet_exit_status("660f3a63c10cc3")                         # pcmpistri xmm0, xmm1, 0xc; ret
+
+    def test_unimplemented_instruction_traps_at_run_time_when_asked(self):
+        # the instruction is reached: #UD with the instruction named
+        r = snippet_exit_status("660f3a63c10cc3", trap_unsupported=True)
+        self.assertEqual(r.returncode, 0x1D)
+        self.assertIn(b"instruction not implemented by exe2mac: pcmpistri", r.stderr)
+        # not reached (skipped by a branch): the program is unaffected
+        r = snippet_exit_status("31c085c07406" "660f3a63c10c" "b805000000c3", trap_unsupported=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+
+@unittest.skipUnless(CC and dec.capstone is not None, "C compiler and capstone required")
+class CpuidTests(_SnippetCheck, unittest.TestCase):
+    def test_vendor_leaf(self):
+        # xor eax,eax; cpuid
+        self.check("31c00fa2c3", {"rax": 1, "rbx": 0x32657865, "rdx": 0x5663616D, "rcx": 0x30555043},
+                   {"cf": 0, "pf": 1, "af": 0, "zf": 1, "sf": 0, "of": 0})
+
+    def test_feature_leaf_is_sse2_baseline(self):
+        # mov eax,1; cpuid  -> SSE2 yes, SSE3/AVX/OSXSAVE no; upper halves cleared
+        self.check("48c7c3ffffffffb8010000000fa2c3",
+                   {"rax": 0x6F1, "rbx": 0x10800, "rcx": 0, "rdx": 0x07008101})
+
+    def test_unknown_leaf_reads_zero(self):
+        self.check("b8070000000fa2c3", {"rax": 0, "rbx": 0, "rcx": 0, "rdx": 0})

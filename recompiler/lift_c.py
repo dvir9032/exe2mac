@@ -35,6 +35,12 @@ COND_NAMES = ["X86_CC_O", "X86_CC_NO", "X86_CC_B", "X86_CC_AE", "X86_CC_E", "X86
               "X86_CC_BE", "X86_CC_A", "X86_CC_S", "X86_CC_NS", "X86_CC_P", "X86_CC_NP",
               "X86_CC_L", "X86_CC_GE", "X86_CC_LE", "X86_CC_G"]
 
+# Instructions that raise an exception (no SEH yet: the process ends with this status).
+TRAP_STATUS = {"int3": (0x80000003, "int3: breakpoint"),                # STATUS_BREAKPOINT
+               "ud2": (0xC000001D, "ud2: illegal instruction")}        # STATUS_ILLEGAL_INSTRUCTION
+FAULT_INTS = {0x29: (0xC0000409, "int 0x29: __fastfail"),              # STATUS_STACK_BUFFER_OVERRUN
+              0x2C: (0xC0000420, "int 0x2c: assertion failure")}       # STATUS_ASSERTION_FAILURE
+
 BINOPS = {"add": "x86_add", "sub": "x86_sub", "and": "x86_and", "or": "x86_or", "xor": "x86_xor",
           "adc": "x86_adc", "sbb": "x86_sbb"}
 SHIFTS = {"shr": "x86_shr", "shl": "x86_shl", "sal": "x86_shl", "sar": "x86_sar"}
@@ -187,7 +193,9 @@ class _Fn:
 
 
 class Lifter:
-    def __init__(self, pe, program: Program):
+    def __init__(self, pe, program: Program, trap_unsupported: bool = False):
+        self.trap_unsupported = trap_unsupported
+        self.trapped: list[Instruction] = []
         self.pe = pe
         self.prog = program
         self.pref_base = pe.image_base
@@ -226,6 +234,23 @@ class Lifter:
                 raise TranslationError(f"unsupported import {dll}!{name}")
 
     # ---- instruction lowering ----------------------------------------------
+    def lift_or_trap(self, insn: Instruction, fn_entry: int, block_succ: list[int]) -> list[str]:
+        """Lift one instruction. With ``trap_unsupported``, an instruction form
+        the translator does not implement becomes a run-time #UD
+        (STATUS_ILLEGAL_INSTRUCTION) at that address instead of a translation
+        error, and is listed in ``self.trapped``. Control-flow instructions are
+        never trapped: they define the CFG."""
+        try:
+            return self.lift_insn(insn, fn_entry, block_succ)
+        except TranslationError:
+            if not self.trap_unsupported or insn.flow != "none":
+                raise
+        self.trapped.append(insn)
+        text = insn.text.replace("\\", "\\\\").replace('"', '\\"')
+        return [f"/* 0x{insn.address:x}: {insn.text} -- NOT IMPLEMENTED: run-time #UD */",
+                f"s->rip = {self.va_expr(insn.address)};",
+                f'exe2mac_raise(s, 0xC000001Du, "instruction not implemented by exe2mac: {text}");']
+
     def lift_insn(self, insn: Instruction, fn_entry: int, block_succ: list[int]) -> list[str]:
         f = _Fn(self, insn)
         mn = insn.mnemonic
@@ -447,6 +472,17 @@ class Lifter:
             f.emit(f"s->rip = {self.va_expr(insn.address)};")
             f.emit("s->rip = x86_pop64(s);")
             f.emit("return;")
+        elif mn == "cpuid":
+            f.emit("x86_cpuid(s);")
+        elif mn == "xgetbv":
+            # CPUID reports OSXSAVE = 0, so XGETBV raises #UD (SDM: CR4.OSXSAVE = 0)
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            f.emit('exe2mac_raise(s, 0xC000001Du, "xgetbv: #UD (the virtual CPU reports OSXSAVE = 0)");')
+        elif mn in ("int3", "ud2") or (mn == "int" and ops and ops[0].kind == "imm" and ops[0].imm in FAULT_INTS):
+            # Without SEH these end the process with the Windows status of the exception.
+            status, what = (TRAP_STATUS[mn] if mn != "int" else FAULT_INTS[ops[0].imm])
+            f.emit(f"s->rip = {self.va_expr(insn.address)};")
+            f.emit(f'exe2mac_raise(s, 0x{status:08X}u, "{what}");')
         else:
             raise _err(insn, "unsupported instruction")
         return f.lines
@@ -672,7 +708,7 @@ class Lifter:
             b = fn.blocks[start]
             lines.append(f"{self.label(start)}:")
             for insn in b.instructions:
-                for l in self.lift_insn(insn, fn.entry, b.successors):
+                for l in self.lift_or_trap(insn, fn.entry, b.successors):
                     lines.append("    " + l)
             last = b.instructions[-1]
             if b.terminator in ("fallthrough", "call"):
@@ -681,7 +717,7 @@ class Lifter:
                 lines.append(f"    goto {self.label(b.successors[0])};")
             elif b.terminator == "call_noreturn":
                 pass                                 # call emission already ends in a fault
-            elif b.terminator in ("ret", "jump", "cond", "jump_table", "import_tailcall", "tailcall_dynamic"):
+            elif b.terminator in ("ret", "jump", "cond", "jump_table", "import_tailcall", "tailcall_dynamic", "trap"):
                 pass
             else:
                 raise TranslationError(f"block 0x{start:x}: unsupported terminator {b.terminator} at 0x{last.address:x}")
@@ -767,6 +803,7 @@ class Lifter:
         return "\n".join(L) + "\n"
 
 
-def lift_program(pe, strict_indirect_jumps: bool = False) -> str:
+def lift_program(pe, strict_indirect_jumps: bool = False, trap_unsupported: bool = False) -> str:
     """Discover reachable code and return the generated C translation unit."""
-    return Lifter(pe, discover(pe, strict_indirect_jumps=strict_indirect_jumps)).emit()
+    return Lifter(pe, discover(pe, strict_indirect_jumps=strict_indirect_jumps),
+                  trap_unsupported=trap_unsupported).emit()

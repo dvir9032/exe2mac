@@ -363,6 +363,10 @@ def discover(pe, strict_indirect_jumps: bool = False) -> Program:
         func_queue[:] = [cand]
         try:
             drain()
+            for va in d.insns.keys() - snapshot[0].keys():
+                why = _implausible(d.insns[va])
+                if why:
+                    raise CFGError(f"0x{va:x}: {why} (data decoded as code?)")
         except (CFGError, DecodeError) as exc:
             (d.insns, d.covered, func_succ, func_term, call_sites, jump_tables,
              dynamic_tail_jumps, func_roots, lea_targets) = snapshot
@@ -383,6 +387,22 @@ def discover(pe, strict_indirect_jumps: bool = False) -> Program:
 
 
 MAX_JUMP_TABLE_ENTRIES = 4096
+
+# Instructions that compiled user-mode x64 code does not contain. A candidate
+# root (relocated pointer or lea target) whose code contains one is data.
+_IMPLAUSIBLE = frozenset({"retf", "retfq", "hlt", "in", "out", "insb", "insw", "insd", "outsb", "outsw", "outsd",
+                          "xlatb", "cli", "sti", "iret", "iretd", "iretq", "lds", "les", "into", "enter",
+                          "sysret", "sysexit", "wbinvd", "invd", "lgdt", "lidt", "lldt", "ltr", "clts"})
+_FASTFAIL_INTS = frozenset({0x29, 0x2C, 0x2D})   # __fastfail, assertion failure, debug service
+
+
+def _implausible(insn):
+    if insn.mnemonic in _IMPLAUSIBLE:
+        return f"implausible instruction '{insn.text}'"
+    if insn.mnemonic == "int" and not (insn.operands and insn.operands[0].kind == "imm"
+                                       and insn.operands[0].imm in _FASTFAIL_INTS):
+        return f"implausible instruction '{insn.text}'"
+    return None
 
 # Windows x64 callee-saved GPRs (hardware indices): RBX RBP RSI RDI R12-R15.
 _NONVOLATILE = frozenset({3, 5, 6, 7, 12, 13, 14, 15})

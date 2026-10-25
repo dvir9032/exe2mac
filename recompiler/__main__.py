@@ -44,12 +44,16 @@ def main(argv=None):
         sp.add_argument("--strict-indirect-jumps", action="store_true",
                         help="reject indirect jmps that are not jump tables or IAT tail calls at "
                              "translation time instead of translating them as dynamic tail calls")
+        sp.add_argument("--trap-unsupported", action="store_true",
+                        help="translate instruction forms exe2mac does not implement into a run-time "
+                             "#UD fault (STATUS_ILLEGAL_INSTRUCTION) instead of failing the translation")
     args = p.parse_args(argv)
     strict = args.strict_indirect_jumps if hasattr(args, "strict_indirect_jumps") else False
+    trap = getattr(args, "trap_unsupported", False)
 
     try:
         if args.cmd == "translate":
-            Path(args.output).write_text(translate(args.exe, strict_indirect_jumps=strict))
+            Path(args.output).write_text(translate(args.exe, strict_indirect_jumps=strict, trap_unsupported=trap))
             return 0
         if args.cmd == "doctor":
             from .package import doctor
@@ -61,17 +65,17 @@ def main(argv=None):
         if args.cmd == "package":
             from .package import package
             res = package(args.exe, args.output, app_name=args.name, dmg=not args.no_dmg,
-                          sign=not args.no_sign, cc=args.cc, strict_indirect_jumps=strict)
+                          sign=not args.no_sign, cc=args.cc, strict_indirect_jumps=strict, trap_unsupported=trap)
             print(f"app:    {res['app']}")
             print(f"signed: {res['signed']} (ad-hoc)")
             print(f"dmg:    {res['dmg'] or 'not created (needs macOS hdiutil or --no-dmg given)'}")
             return 0
         if args.cmd == "build":
-            out = build(args.exe, args.output, cc=args.cc, strict_indirect_jumps=strict)
+            out = build(args.exe, args.output, cc=args.cc, strict_indirect_jumps=strict, trap_unsupported=trap)
             print(f"built {out} for {platform.system()} {platform.machine()}")
             return 0
         with tempfile.TemporaryDirectory() as td:
-            exe = build(args.exe, os.path.join(td, "guest"), cc=args.cc, strict_indirect_jumps=strict)
+            exe = build(args.exe, os.path.join(td, "guest"), cc=args.cc, strict_indirect_jumps=strict, trap_unsupported=trap)
             res = subprocess.run([str(exe)], capture_output=True)
         sys.stdout.buffer.write(res.stdout)
         sys.stderr.buffer.write(res.stderr)

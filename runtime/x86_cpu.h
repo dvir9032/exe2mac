@@ -433,4 +433,38 @@ static inline uint64_t x86_pop64(x86_state *s) {
 #ifdef __cplusplus
 }
 #endif
+/* ------------------------------------------------------------------ */
+/* CPUID: the translated program runs on a virtual CPU that advertises exactly
+ * what exe2mac implements: x86-64 baseline with SSE and SSE2. No SSE3+, AVX,
+ * OSXSAVE, POPCNT, RDTSC... so feature-dispatched code (CRT memcpy, math)
+ * takes its SSE2 paths. Vendor "exe2macVCPU0" keeps vendor-specific paths off.
+ * Writes EAX/EBX/ECX/EDX as 32-bit values (upper halves zeroed). */
+#define EXE2MAC_CPUID_MAX_LEAF 1u
+#define EXE2MAC_CPUID_MAX_EXT  0x80000001u
+static inline void x86_cpuid(x86_state *s) {
+    uint32_t leaf = (uint32_t)s->gpr[0], a = 0, b = 0, c = 0, d = 0;
+    switch (leaf) {
+    case 0:
+        a = EXE2MAC_CPUID_MAX_LEAF;
+        b = 0x32657865u; d = 0x5663616Du; c = 0x30555043u;    /* "exe2" "macV" "CPU0" (EBX, EDX, ECX) */
+        break;
+    case 1:
+        a = 0x000006F1u;                                        /* family 6, model 0xF, stepping 1 */
+        b = (1u << 16) | (8u << 8);                             /* 1 logical CPU, CLFLUSH line 8*8 = 64 bytes */
+        c = 0;                                                  /* no SSE3/SSSE3/SSE4/POPCNT/AVX/OSXSAVE */
+        d = (1u << 0) | (1u << 8) | (1u << 15) | (1u << 24) | (1u << 25) | (1u << 26);
+                                                                /* FPU CX8 CMOV FXSR SSE SSE2 */
+        break;
+    case 0x80000000u:
+        a = EXE2MAC_CPUID_MAX_EXT;
+        break;
+    case 0x80000001u:
+        d = (1u << 20) | (1u << 29);                            /* NX, long mode */
+        break;
+    default:                                                    /* unsupported leaves read as zero */
+        break;
+    }
+    s->gpr[0] = a; s->gpr[3] = b; s->gpr[1] = c; s->gpr[2] = d;
+}
+
 #endif
